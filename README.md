@@ -2,7 +2,7 @@
   <img src="logo.png" alt="Dockman" width="200">
 </p>
 
-# Dockman
+# Dockman by Ameya
 
 **Additional, fully customizable Docks for macOS — each one pinned to a specific desktop (Space).**
 
@@ -22,6 +22,23 @@ The built-in macOS Dock is a singleton: there is exactly one, it follows the act
 - **`dockman://` URL scheme** — script your Docks: `dockman://toggle?dock=NAME`, plus `pin`, `show`, and `hide`.
 - **Resilient** — a Dock whose desktop is deleted parks on the current desktop with one-click re-pin; bindings survive login Space-ID churn; config migrates forward automatically.
 - **Faceless menu-bar agent** — no icon in the system Dock; everything is managed from the menu-bar item (▤ rectangle-stack icon).
+
+### Productivity
+- **Any edge, any alignment** — bottom, top, left or right; start, centre or end (e.g. a fixed bottom-left Dock), with a position lock.
+- **Multi-row Docks** (up to 4), **profiles** (save and switch whole layouts), **undo/redo** for every Dock edit.
+- **Docks that follow your app** — show a Dock only while a chosen app is frontmost.
+- **Type-to-launch search** (⌃⌥Space) across Dock items and installed apps; **hotkeys** ⌃⌥1–9 per Dock.
+- **Widgets** — clock, battery, shelf, recent files, clipboard history (memory only, skips password managers), quick notes, next calendar event.
+
+### Per-app power
+- **App actions** — every app's menu-bar commands, with their shortcuts, from the Dock icon; pin your favourites.
+- **One-click window screenshot**, **window list**, **scroll to cycle windows**, **drop a file on an app** to open it there.
+- **Customize each app** — rename it, choose what a click does (open, summon windows, window list, screenshot, hide others), toggle its badge.
+
+### Accessibility & feel
+- **Full keyboard navigation** (⌃⌥0), VoiceOver labels and announcements.
+- **Dwell click**, **big targets**, **high contrast**, **large labels** with font choice, **colour-blind-safe indicators** (dot, bar, ring).
+- **Hover effects** (grow, lift, glow), **launch effects** (bounce, pulse), motion speed control; honours Reduce Motion. Optional subtle sounds.
 
 ## How it works (the crux)
 
@@ -131,7 +148,8 @@ The contract tests and the spike talk to the real WindowServer, so they must run
 | 1 — Walking skeleton | Agent app, default dock, pin-to-desktop, app launching | ✅ Done |
 | 2 — Resilience | Orphan parking & re-pin, binding restore across logins, fullscreen policy, config migration, multi-display reconcile | ✅ Done |
 | 3 — Multiple docks & richer items | Item kinds, running-apps zone, drag-and-drop, folder stacks, URL scheme | ✅ Done |
-| 4 — Design & polish | Settings window, styles, magnification, auto-hide | 🚧 Next |
+| 4 — Design & polish | Settings window, styles, magnification, auto-hide | ✅ Done |
+| 5 — Productivity & accessibility | Per-app actions, search, keyboard, widgets, profiles, multi-row | ✅ Done |
 
 **31 tests green.** Acceptance criteria verified live on a 3-display setup with "Displays have separate Spaces" off. See [`docs/07-roadmap.md`](docs/07-roadmap.md) for the full plan.
 
@@ -145,4 +163,4 @@ Issues and pull requests are welcome. Before opening a PR:
 
 ## License
 
-Dockman is released under the [MIT License](LICENSE).
+Dockman by Ameya is maintained by Sahil Nahar / Ameya and released under the [MIT License](LICENSE).

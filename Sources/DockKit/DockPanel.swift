@@ -20,6 +20,8 @@ public final class DockPanel: NSPanel {
         collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
     }
 
-    public override var canBecomeKey: Bool { false }
+    /// True only while the Dock has keyboard focus (⌃⌥0); clicks never make it key.
+    public var allowsKeyboardFocus = false
+    public override var canBecomeKey: Bool { allowsKeyboardFocus }
     public override var canBecomeMain: Bool { false }
 }

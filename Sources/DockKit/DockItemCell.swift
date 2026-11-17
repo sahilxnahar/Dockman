@@ -1,6 +1,21 @@
 import AppKit
 import ConfigKit
 
+/// Accessibility options shared by every Dock (set by the app from `GlobalSettings.access`).
+public enum DockAccess {
+    public static var prefs = AccessPrefs()
+    /// User's choice, or macOS Increase Contrast.
+    static var highContrast: Bool { prefs.highContrast || NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
+}
+
+/// Undo/redo of dock edits, offered from every Dock's menu (state owned by the app).
+public enum DockUndo {
+    public static var canUndo = false
+    public static var canRedo = false
+    public static var undo: (() -> Void)?
+    public static var redo: (() -> Void)?
+}
+
 /// One interactive icon in a Dock: detects click vs drag, shows a running dot,
 /// and raises context-menu/drag callbacks. Used for app/file/folder/action items
 /// and for synthetic running-apps-zone entries.
@@ -11,16 +26,20 @@ public final class DockItemCell: NSView {
     public let item: DockItem
     /// Index in the Dock's `items` array, or nil for dynamic zone entries.
     public let modelIndex: Int?
-    public var isRunning = false {
-        didSet {
-            dot.isHidden = !isRunning
-            setAccessibilityValue(isRunning ? "running" : nil)
-        }
-    }
+    public var isRunning = false { didSet { updateIndicator() } }
+    /// The app is frontmost: drawn with a different *shape*, never colour alone.
+    public var isActive = false { didSet { updateIndicator() } }
 
     public var onActivate: (() -> Void)?
     public var onContextMenu: ((NSEvent) -> Void)?
     public var onBeginDrag: ((DockItemCell, NSEvent) -> Void)?
+    /// Scroll-wheel over the icon (used to cycle the app's windows).
+    public var onScroll: ((NSEvent) -> Void)?
+    /// Per-dock motion style (set by the Dock right after creating the cell).
+    public var hoverEffect: Appearance.HoverEffect = .grow
+    public var launchEffect: Appearance.LaunchEffect = .bounce
+    public var motionSpeed: CGFloat = 1
+    private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     /// When true the Dock drives the icon size via `setMagnification` on cursor
     /// movement, so the cell's own hover-grow stands down to avoid fighting it.
@@ -37,18 +56,20 @@ public final class DockItemCell: NSView {
     private var bouncePanel: NSPanel?
     private let badge = NSTextField(labelWithString: "")
     private var widgetObserver: NSObjectProtocol?
+    private var dwellLayer: CAShapeLayer?
+    private var dwellWork: DispatchWorkItem?
 
     /// Display name used for the hover label and VoiceOver.
     public let displayName: String?
 
     public init(item: DockItem, modelIndex: Int?, iconSize: CGFloat, edge: Appearance.Edge = .bottom,
-                customIcon: String? = nil) {
+                customIcon: String? = nil, labelOverride: String? = nil) {
         self.item = item
         self.modelIndex = modelIndex
         self.iconSize = iconSize
         self.edge = edge
         self.customIcon = customIcon
-        displayName = item.label ?? (item.path.map { ($0 as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "") })
+        displayName = labelOverride ?? item.label ?? (item.path.map { ($0 as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "") })
         super.init(frame: NSRect(x: 0, y: 0, width: iconSize, height: iconSize + Self.dotZone))
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
@@ -62,9 +83,6 @@ public final class DockItemCell: NSView {
         addSubview(iconView)
 
         dot.wantsLayer = true
-        dot.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.7).cgColor
-        dot.layer?.cornerRadius = 2.5
-        dot.frame = NSRect(x: iconSize / 2 - 2.5, y: 1, width: 5, height: 5)
         dot.isHidden = true
         addSubview(dot)
 
@@ -80,7 +98,8 @@ public final class DockItemCell: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         setAccessibilityLabel(displayName)
-        if case .widget(let kind) = item, kind == .clock || kind == .battery {
+        if case .widget(.clipboard) = item { DockWidgets.startUpdates(for: .clipboard) }
+        if case .widget(let kind) = item, kind == .clock || kind == .battery || kind == .calendar {
             DockWidgets.startUpdates(for: kind)
             setAccessibilityLabel(DockWidgets.accessibilityText(for: kind))
             widgetObserver = NotificationCenter.default.addObserver(
@@ -112,6 +131,76 @@ public final class DockItemCell: NSView {
 
     public func reloadIcon() {
         iconView.image = Self.customImage(customIcon, size: iconSize) ?? Self.image(for: item, size: iconSize)
+    }
+
+    // MARK: Running indicator
+
+    /// Running = small mark, frontmost = longer/filled mark, in the chosen style.
+    private func updateIndicator() {
+        let style = DockAccess.prefs.indicator
+        dot.isHidden = !isRunning || style == .none
+        setAccessibilityValue(isRunning ? (isActive ? "running, frontmost" : "running") : nil)
+        guard !dot.isHidden, let layer = dot.layer else { return }
+        let k: CGFloat = DockAccess.highContrast ? 1.5 : 1
+        var size: NSSize
+        switch style {
+        case .bar:  size = NSSize(width: (isActive ? 22 : 10) * k, height: 3 * k)
+        case .ring: size = NSSize(width: 7 * k, height: 7 * k)
+        default:    size = NSSize(width: (isActive ? 14 : 5) * k, height: 5 * k)
+        }
+        size.height = min(size.height, Self.dotZone - 1)
+        dot.frame = NSRect(x: (iconSize - size.width) / 2, y: (Self.dotZone - size.height) / 2, width: size.width, height: size.height)
+        let color = NSColor.labelColor.withAlphaComponent(DockAccess.highContrast ? 1 : 0.75).cgColor
+        layer.cornerRadius = size.height / 2
+        if style == .ring && !isActive {
+            layer.backgroundColor = nil
+            layer.borderWidth = 1.5 * k
+            layer.borderColor = color
+        } else {
+            layer.backgroundColor = color
+            layer.borderWidth = 0
+        }
+    }
+
+    // MARK: Dwell-click
+
+    /// Rest the cursor on the icon: a ring fills over the dwell delay, then it opens.
+    private func startDwell() {
+        cancelDwell()
+        let delay = DockAccess.prefs.dwellDelay
+        let ring = CAShapeLayer()
+        let r = baseIconFrame.insetBy(dx: -2, dy: -2)
+        ring.path = CGPath(roundedRect: r, cornerWidth: iconSize * 0.24, cornerHeight: iconSize * 0.24, transform: nil)
+        ring.fillColor = nil
+        ring.strokeColor = NSColor.controlAccentColor.cgColor
+        ring.lineWidth = 3
+        ring.strokeEnd = 1
+        layer?.addSublayer(ring)
+        let fill = CABasicAnimation(keyPath: "strokeEnd")
+        fill.fromValue = 0
+        fill.toValue = 1
+        fill.duration = delay
+        ring.add(fill, forKey: "dwell")
+        dwellLayer = ring
+        let work = DispatchWorkItem { [weak self] in
+            self?.cancelDwell()
+            self?.onActivate?()
+        }
+        dwellWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func cancelDwell() {
+        dwellWork?.cancel(); dwellWork = nil
+        dwellLayer?.removeFromSuperlayer(); dwellLayer = nil
+    }
+
+    /// Accent outline on the icon while it has keyboard focus.
+    public func setKeyboardFocus(_ on: Bool) {
+        iconView.wantsLayer = true
+        iconView.layer?.cornerRadius = iconSize * 0.22
+        iconView.layer?.borderWidth = on ? 3 : 0
+        iconView.layer?.borderColor = NSColor.keyboardFocusIndicatorColor.cgColor
     }
 
     /// Accent ring while something is dragged over a drop target (the Trash).
@@ -165,7 +254,7 @@ public final class DockItemCell: NSView {
         anim.values = [start, top, start].map { NSValue(point: $0) }
         anim.keyTimes = [0, 0.45, 1]
         anim.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
-        anim.duration = 0.6
+        anim.duration = 0.6 / Double(motionSpeed)
         anim.repeatCount = 5
         CATransaction.begin()
         CATransaction.setCompletionBlock { [weak self] in self?.stopBounce() }
@@ -190,7 +279,12 @@ public final class DockItemCell: NSView {
         return true
     }
 
+    public override func scrollWheel(with event: NSEvent) {
+        if let onScroll { onScroll(event) } else { super.scrollWheel(with: event) }
+    }
+
     public override func mouseDown(with event: NSEvent) {
+        cancelDwell()
         HoverLabel.shared.hide()
         downPoint = event.locationInWindow
         dragging = false
@@ -225,10 +319,12 @@ public final class DockItemCell: NSView {
 
     public override func mouseEntered(with event: NSEvent) {
         if !magnificationEnabled { setHovered(true) }
+        if DockAccess.prefs.dwellClick { startDwell() }
         if let displayName { HoverLabel.shared.show(displayName, beside: self, edge: edge) }
     }
     public override func mouseExited(with event: NSEvent) {
         if !magnificationEnabled { setHovered(false) }
+        cancelDwell()
         HoverLabel.shared.hide(ifOwnedBy: self)
     }
     public override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -239,17 +335,69 @@ public final class DockItemCell: NSView {
     private var baseIconFrame: NSRect { NSRect(x: 0, y: Self.dotZone, width: iconSize, height: iconSize) }
 
     private func setHovered(_ hovered: Bool) {
-        let grow = iconSize * 0.18
-        let enlarged = NSRect(x: -grow / 2, y: Self.dotZone - grow / 2,
-                              width: iconSize + grow, height: iconSize + grow)
-        let target = hovered ? enlarged : baseIconFrame
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        var target = baseIconFrame
+        switch hoverEffect {
+        case .grow where hovered:
+            let grow = iconSize * 0.18
+            target = NSRect(x: -grow / 2, y: Self.dotZone - grow / 2, width: iconSize + grow, height: iconSize + grow)
+        case .lift where hovered:
+            // Rise toward the screen's middle, whichever edge the dock is on (stays inside the cell).
+            let d = min(Self.dotZone, iconSize * 0.12)
+            switch edge {
+            case .bottom: target.origin.y += d
+            case .top:    target.origin.y -= d
+            case .left:   target.origin.x += d
+            case .right:  target.origin.x -= d
+            }
+        case .glow:
+            iconView.wantsLayer = true
+            iconView.shadow = hovered ? {
+                let s = NSShadow()
+                s.shadowColor = NSColor.controlAccentColor.withAlphaComponent(0.9)
+                s.shadowBlurRadius = iconSize * 0.18
+                return s
+            }() : nil
+        default:
+            break
+        }
+        if reduceMotion {
             iconView.frame = target                    // respect Reduce Motion: no animation
         } else {
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.12
+                ctx.duration = 0.14 / motionSpeed
+                ctx.timingFunction = CAMediaTimingFunction(name: hovered ? .easeOut : .easeInEaseOut)
                 iconView.animator().frame = target
             }
+        }
+    }
+
+    /// Quick press-in on click: the icon dips and springs back, confirming the open.
+    public func playPress() {
+        guard !reduceMotion, let layer = iconView.layer ?? { iconView.wantsLayer = true; return iconView.layer }() else { return }
+        let squash = CAKeyframeAnimation(keyPath: "transform.scale")
+        squash.values = [1, 0.86, 1.04, 1]
+        squash.keyTimes = [0, 0.35, 0.75, 1]
+        squash.duration = 0.28 / Double(motionSpeed)
+        // Scale about the icon's centre, not its corner.
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.position = CGPoint(x: iconView.frame.midX, y: iconView.frame.midY)
+        layer.add(squash, forKey: "press")
+    }
+
+    /// Launch feedback in this dock's style: bounce (overlay hop) or pulse (in place).
+    public func playLaunch() {
+        switch launchEffect {
+        case .bounce: startBounce()
+        case .pulse:
+            guard !reduceMotion, let layer = iconView.layer ?? { iconView.wantsLayer = true; return iconView.layer }() else { return }
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1
+            pulse.toValue = 0.35
+            pulse.autoreverses = true
+            pulse.duration = 0.45 / Double(motionSpeed)
+            pulse.repeatCount = 3
+            layer.add(pulse, forKey: "pulse")
+        case .none: break
         }
     }
 
@@ -317,82 +465,3 @@ public final class DockItemCell: NSView {
     }
 }
 
-/// The single floating name label shown above (or beside) the hovered icon, like the
-/// system Dock's. One shared panel, placed on the inward side of whichever edge the
-/// Dock sits on, so it never runs off the screen.
-@MainActor
-final class HoverLabel {
-    static let shared = HoverLabel()
-
-    private let panel: NSPanel
-    private let field = NSTextField(labelWithString: "")
-    private weak var owner: NSView?
-
-    private init() {
-        panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: true)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.ignoresMouseEvents = true
-        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
-
-        let bg = NSVisualEffectView()
-        bg.material = .hudWindow
-        bg.state = .active
-        bg.blendingMode = .behindWindow
-        bg.wantsLayer = true
-        bg.layer?.cornerRadius = 7
-        bg.layer?.masksToBounds = true
-        field.font = .systemFont(ofSize: 13, weight: .medium)
-        field.textColor = .labelColor
-        field.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 10),
-            field.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
-            field.centerYAnchor.constraint(equalTo: bg.centerYAnchor),
-        ])
-        panel.contentView = bg
-    }
-
-    func show(_ text: String, beside view: NSView, edge: Appearance.Edge) {
-        guard let window = view.window else { return }
-        owner = view
-        field.stringValue = text
-        let size = NSSize(width: ceil(field.intrinsicContentSize.width) + 20, height: 24)
-        let r = window.convertToScreen(view.convert(view.bounds, to: nil))
-        let gap: CGFloat = 8
-        var origin: NSPoint
-        switch edge {
-        case .bottom: origin = NSPoint(x: r.midX - size.width / 2, y: r.maxY + gap)
-        case .top:    origin = NSPoint(x: r.midX - size.width / 2, y: r.minY - gap - size.height)
-        case .left:   origin = NSPoint(x: r.maxX + gap, y: r.midY + DockItemCell.dotZone / 2 - size.height / 2)
-        case .right:  origin = NSPoint(x: r.minX - gap - size.width, y: r.midY + DockItemCell.dotZone / 2 - size.height / 2)
-        }
-        // Keep the label on the Dock's screen.
-        if let screen = window.screen?.frame {
-            origin.x = min(max(origin.x, screen.minX + 4), screen.maxX - size.width - 4)
-            origin.y = min(max(origin.y, screen.minY + 4), screen.maxY - size.height - 4)
-        }
-        let wasVisible = panel.isVisible
-        panel.setFrame(NSRect(origin: origin, size: size), display: true)
-        if wasVisible || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            panel.alphaValue = 1                       // moving between icons: switch instantly
-        } else {
-            panel.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { $0.duration = 0.12; panel.animator().alphaValue = 1 }
-        }
-        panel.orderFrontRegardless()
-    }
-
-    func hide(ifOwnedBy view: NSView? = nil) {
-        if let view, owner !== view { return }
-        owner = nil
-        // Short grace period so sliding to the next icon swaps the text without a re-fade.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [self] in
-            if owner == nil { panel.orderOut(nil) }
-        }
-    }
-}

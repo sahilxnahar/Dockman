@@ -82,6 +82,19 @@ public struct Appearance: Codable, Equatable, Sendable {
     /// Floating position as fractions (0–1) of the free space on the display.
     public var floatX: Double
     public var floatY: Double
+    /// Where along its edge the Dock sits (e.g. bottom + start = bottom-left).
+    public enum Alignment: String, Codable, Sendable, CaseIterable { case start, center, end }
+    public var alignment: Alignment
+    /// Freeze the layout: no window dragging (floating) and no item reordering.
+    public var locked: Bool
+    /// Rows (columns on a side dock), 1–4.
+    public var rows: Int
+    /// Motion: what hovering and launching look like, and how fast (0.5 = slow, 2 = quick).
+    public enum HoverEffect: String, Codable, Sendable, CaseIterable { case grow, lift, glow, none }
+    public enum LaunchEffect: String, Codable, Sendable, CaseIterable { case bounce, pulse, none }
+    public var hoverEffect: HoverEffect
+    public var launchEffect: LaunchEffect
+    public var motionSpeed: Double
 
     public static let defaultCornerRadius: Double = 18
     public static let defaultPadding: Double = 10
@@ -107,11 +120,18 @@ public struct Appearance: Codable, Equatable, Sendable {
         floating = false
         floatX = 0.5
         floatY = 0.3
+        alignment = .center
+        locked = false
+        rows = 1
+        hoverEffect = .grow
+        launchEffect = .bounce
+        motionSpeed = 1
     }
 
     private enum CodingKeys: String, CodingKey {
         case edge, iconSize, style, tintHex, magnification, magnificationScale, padding, edgeGap
-        case cornerRadius, backgroundOpacity, floating, floatX, floatY
+        case cornerRadius, backgroundOpacity, floating, floatX, floatY, alignment, locked, rows
+        case hoverEffect, launchEffect, motionSpeed
     }
 
     // Tolerant decode so configs written before newer fields existed keep the rest.
@@ -131,6 +151,12 @@ public struct Appearance: Codable, Equatable, Sendable {
         floating = try c.decodeIfPresent(Bool.self, forKey: .floating) ?? false
         floatX = min(max(try c.decodeIfPresent(Double.self, forKey: .floatX) ?? 0.5, 0), 1)
         floatY = min(max(try c.decodeIfPresent(Double.self, forKey: .floatY) ?? 0.3, 0), 1)
+        alignment = try c.decodeIfPresent(Alignment.self, forKey: .alignment) ?? .center
+        locked = try c.decodeIfPresent(Bool.self, forKey: .locked) ?? false
+        rows = min(max(try c.decodeIfPresent(Int.self, forKey: .rows) ?? 1, 1), 4)
+        hoverEffect = (try? c.decodeIfPresent(HoverEffect.self, forKey: .hoverEffect)) ?? .grow
+        launchEffect = (try? c.decodeIfPresent(LaunchEffect.self, forKey: .launchEffect)) ?? .bounce
+        motionSpeed = min(max(try c.decodeIfPresent(Double.self, forKey: .motionSpeed) ?? 1, 0.5), 2)
     }
 
     /// One-click looks: style + tint + corners + opacity.
@@ -185,9 +211,12 @@ public struct DockAction: Codable, Equatable, Sendable {
 /// A single Dock entry.
 /// Built-in Dock widgets that aren't files or apps.
 public enum WidgetKind: String, Codable, Sendable, CaseIterable {
-    case trash, clock, battery, shelf, recents
+    case trash, clock, battery, shelf, recents, clipboard, notes, calendar
     public var displayName: String {
         switch self {
+        case .clipboard: return "Clipboard History"
+        case .notes:     return "Quick Notes"
+        case .calendar:  return "Next Event"
         case .trash:   return "Trash"
         case .clock:   return "Clock"
         case .battery: return "Battery"
@@ -197,6 +226,9 @@ public enum WidgetKind: String, Codable, Sendable, CaseIterable {
     }
     public var symbol: String {
         switch self {
+        case .clipboard: return "doc.on.clipboard"
+        case .notes:     return "note.text"
+        case .calendar:  return "calendar"
         case .trash:   return "trash"
         case .clock:   return "clock"
         case .battery: return "battery.75percent"
@@ -300,6 +332,8 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
     public var mirrorsSystemDock: Bool
     /// Show only while one of these Focus modes is on (by name); empty = always.
     public var focusModes: [String]
+    /// Show only while one of these apps (bundle paths) is frontmost; empty = always.
+    public var showForApps: [String]
 
     public init(id: UUID = UUID(), name: String, items: [DockItem],
                 binding: Binding, appearance: Appearance = Appearance(),
@@ -315,10 +349,11 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
         self.customIcons = customIcons
         mirrorsSystemDock = false
         focusModes = []
+        showForApps = []
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, items, binding, appearance, behavior, enabled, customIcons, mirrorsSystemDock, focusModes
+        case id, name, items, binding, appearance, behavior, enabled, customIcons, mirrorsSystemDock, focusModes, showForApps
     }
 
     // Tolerant decoding so configs written by older schema versions (no `behavior`,
@@ -335,6 +370,7 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
         customIcons = try c.decodeIfPresent([String: String].self, forKey: .customIcons) ?? [:]
         mirrorsSystemDock = try c.decodeIfPresent(Bool.self, forKey: .mirrorsSystemDock) ?? false
         focusModes = try c.decodeIfPresent([String].self, forKey: .focusModes) ?? []
+        showForApps = try c.decodeIfPresent([String].self, forKey: .showForApps) ?? []
     }
 }
 
@@ -345,15 +381,18 @@ public struct GlobalSettings: Codable, Equatable, Sendable {
     public var priorDockAutohide: Bool?
     /// The first-run welcome guide has been shown.
     public var onboardingShown: Bool
+    /// Accessibility: shared by every Dock.
+    public var access: AccessPrefs
 
     public init(launchAtLogin: Bool = false, hideSystemDock: Bool = false, priorDockAutohide: Bool? = nil) {
         self.launchAtLogin = launchAtLogin
         self.hideSystemDock = hideSystemDock
         self.priorDockAutohide = priorDockAutohide
         onboardingShown = false
+        access = AccessPrefs()
     }
 
-    private enum CodingKeys: String, CodingKey { case launchAtLogin, hideSystemDock, priorDockAutohide, onboardingShown }
+    private enum CodingKeys: String, CodingKey { case launchAtLogin, hideSystemDock, priorDockAutohide, onboardingShown, access }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -361,10 +400,18 @@ public struct GlobalSettings: Codable, Equatable, Sendable {
         hideSystemDock = try c.decodeIfPresent(Bool.self, forKey: .hideSystemDock) ?? false
         priorDockAutohide = try c.decodeIfPresent(Bool.self, forKey: .priorDockAutohide)
         onboardingShown = try c.decodeIfPresent(Bool.self, forKey: .onboardingShown) ?? false
+        access = try c.decodeIfPresent(AccessPrefs.self, forKey: .access) ?? AccessPrefs()
     }
 }
 
 /// The persisted document.
+/// A saved set of docks the user can switch to (e.g. "Design", "Coding").
+public struct Profile: Codable, Equatable, Sendable {
+    public var name: String
+    public var docks: [DockModel]
+    public init(name: String, docks: [DockModel]) { self.name = name; self.docks = docks }
+}
+
 public struct Config: Codable, Equatable, Sendable {
     /// Bump when the on-disk shape changes; `ConfigStore` migrates forward.
     public static let currentSchemaVersion = 2
@@ -372,12 +419,28 @@ public struct Config: Codable, Equatable, Sendable {
     public var schemaVersion: Int
     public var docks: [DockModel]
     public var global: GlobalSettings
+    /// Per-app preferences keyed by app bundle path.
+    public var apps: [String: AppPrefs]
+    public var profiles: [Profile]
 
     public init(schemaVersion: Int = Config.currentSchemaVersion,
-                docks: [DockModel] = [], global: GlobalSettings = GlobalSettings()) {
+                docks: [DockModel] = [], global: GlobalSettings = GlobalSettings(),
+                apps: [String: AppPrefs] = [:]) {
         self.schemaVersion = schemaVersion
         self.docks = docks
         self.global = global
+        self.apps = apps
+        self.profiles = []
+    }
+
+    private enum CodingKeys: String, CodingKey { case schemaVersion, docks, global, apps, profiles }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        docks = try c.decode([DockModel].self, forKey: .docks)
+        global = try c.decodeIfPresent(GlobalSettings.self, forKey: .global) ?? GlobalSettings()
+        apps = try c.decodeIfPresent([String: AppPrefs].self, forKey: .apps) ?? [:]
+        profiles = try c.decodeIfPresent([Profile].self, forKey: .profiles) ?? []
     }
 
     public static let empty = Config()

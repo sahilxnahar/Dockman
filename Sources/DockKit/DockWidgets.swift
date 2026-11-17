@@ -21,6 +21,7 @@ public enum DockWidgets {
             let next = ceil(Date().timeIntervalSinceReferenceDate / 60) * 60
             let timer = Timer(fire: Date(timeIntervalSinceReferenceDate: next + 0.05), interval: 60, repeats: true) { _ in
                 NotificationCenter.default.post(name: changed, object: WidgetKind.clock)
+                NotificationCenter.default.post(name: changed, object: WidgetKind.calendar)
             }
             timer.tolerance = 0.5
             RunLoop.main.add(timer, forMode: .common)
@@ -31,9 +32,17 @@ public enum DockWidgets {
             }, nil)?.takeRetainedValue() else { return }
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
             powerSource = source
+        case .clipboard:
+            startClipboardWatch()
+        case .calendar:
+            startCalendar()
         default:
             break
         }
+    }
+
+    static func tileImage(size: CGFloat, top: String, main: String) -> NSImage {
+        tile(size: size, top: top, main: main, mainColor: .labelColor)
     }
 
     // MARK: Icons
@@ -42,6 +51,7 @@ public enum DockWidgets {
         switch kind {
         case .clock:   return tile(size: size, top: dayText(), main: timeText(), mainColor: .labelColor)
         case .battery: return batteryImage(size: size)
+        case .calendar: return calendarTile(size: size)
         default:       return nil
         }
     }
@@ -54,6 +64,8 @@ public enum DockWidgets {
         case .battery:
             guard let b = battery() else { return "Battery, on power adapter" }
             return "Battery \(b.percent)%" + (b.charging ? ", charging" : "")
+        case .calendar:
+            return calendarAccessibilityText()
         default:
             return kind.displayName
         }
@@ -186,7 +198,7 @@ public enum DockWidgets {
             }
         case .trash:
             NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/.Trash"))
-        case .shelf, .recents:
+        case .shelf, .recents, .clipboard, .notes, .calendar:
             break   // shown as popovers by DockContentView
         }
     }

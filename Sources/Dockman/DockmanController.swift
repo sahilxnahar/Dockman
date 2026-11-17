@@ -10,7 +10,7 @@ import DockKit
 /// Space/display change (docs/03 §4). Observable so the SwiftUI Settings UI updates.
 final class DockmanController: ObservableObject {
     let store = ConfigStore()
-    @Published private(set) var config: Config
+    @Published var config: Config
     let spaces = SkyLightSpacesService()
     let monitor: SpaceMonitor
     let activity = AppActivityMonitor()
@@ -21,6 +21,13 @@ final class DockmanController: ObservableObject {
     let focus = FocusMonitor()
     private let mirror = SystemDockMirror()
     private var registeredHotkeys: [Int: UUID] = [:]
+    private var hotkeysRegistered = false
+    private var focusedDock: UUID?
+    /// Undo/redo history of dock layouts (items, docks added/removed), newest last.
+    var undoStack: [[DockModel]] = []
+    var redoStack: [[DockModel]] = []
+    /// The frontmost app other than Dockman itself, for app-triggered docks.
+    private(set) var frontAppPath: String?
     /// Dock IDs whose bound Space was deleted and are currently parked (AC-4).
     private(set) var orphanedDockIDs: Set<UUID> = []
     /// Fired after config/topology changes so UI (status item) can refresh.
@@ -40,6 +47,7 @@ final class DockmanController: ObservableObject {
         monitor.start()
         activity.onChange = { [weak self] in self?.refreshActivity() }
         activity.start()
+        frontAppPath = NSWorkspace.shared.frontmostApplication?.bundleURL?.path
         focus.onChange = { [weak self] in self?.reconcileAll() }
         focus.start()
         mirror.onChange = { [weak self] in self?.syncMirroredDocks() }
@@ -118,6 +126,12 @@ final class DockmanController: ObservableObject {
 
     /// Running apps changed → update indicators/zone without re-pinning.
     private func refreshActivity() {
+        // App-triggered docks: re-pin only when the frontmost app actually changed.
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.bundleIdentifier != Bundle.main.bundleIdentifier, front?.bundleURL?.path != frontAppPath {
+            frontAppPath = front?.bundleURL?.path
+            if config.docks.contains(where: { !$0.showForApps.isEmpty }) { reconcileAll(); return }
+        }
         DockBadges.current = AXIsProcessTrusted() ? DockBadges.read() : [:]
         let running = activity.snapshot()
         controllers.values.forEach { $0.refreshItems(running: running) }
@@ -126,6 +140,7 @@ final class DockmanController: ObservableObject {
     // MARK: - Reconcile
 
     func reconcileAll() {
+        DockAccess.prefs = config.global.access
         let topology = monitor.topology
         let running = activity.snapshot()
         for dock in config.docks {
@@ -133,7 +148,9 @@ final class DockmanController: ObservableObject {
             // Focus-gated docks stay hidden (not disabled in the saved config) while none of their modes is on.
             var runtime = dock
             if !dock.focusModes.isEmpty, focus.activeModeNames.isDisjoint(with: dock.focusModes) { runtime.enabled = false }
+            if !dock.showForApps.isEmpty, !dock.showForApps.contains(frontAppPath ?? "") { runtime.enabled = false }
             controller.update(model: runtime)
+            controller.appPrefs = config.apps
             controller.reconcile(topology: topology, running: running)
         }
         // Tear down controllers whose dock was removed.
@@ -151,9 +168,28 @@ final class DockmanController: ObservableObject {
     private func updateHotkeys() {
         var wanted: [Int: UUID] = [:]
         for dock in config.docks { if let d = dock.behavior.hotkeyDigit, wanted[d] == nil { wanted[d] = dock.id } }
-        guard wanted != registeredHotkeys else { return }
+        guard wanted != registeredHotkeys || !hotkeysRegistered else { return }
+        hotkeysRegistered = true
         registeredHotkeys = wanted
-        hotKeys.register(wanted.mapValues { id in { [weak self] in self?.toggleDock(id) } })
+        hotKeys.register(wanted.mapValues { id in { [weak self] in self?.toggleDock(id) } },
+                         fixed: [HotKeys.focusKey: { [weak self] in self?.focusNextDock() },
+                                 HotKeys.searchKey: { [weak self] in self?.openSearch() }])
+    }
+
+    /// ⌃⌥0 / Tab: move keyboard focus to the next dock showing on this desktop.
+    func focusNextDock() {
+        let order = config.docks.map(\.id)
+        let start = focusedDock.flatMap { order.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
+        for offset in 0..<order.count {
+            let id = order[(start + offset) % order.count]
+            if controllers[id]?.beginKeyboardFocus() == true { focusedDock = id; return }
+        }
+        NSSound.beep()                      // no dock visible here
+    }
+
+    /// ⌃⌥Space: type-to-launch over every dock's items plus installed apps.
+    func openSearch() {
+        SearchPanel.shared.show(dockItems: config.docks.flatMap { $0.items.compactMap(\.path) })
     }
 
     /// Give `digit` to `id`, taking it away from any other dock that had it.
@@ -173,7 +209,24 @@ final class DockmanController: ObservableObject {
         return true
     }
 
-    func setFocusModes(_ id: UUID, _ names: [String]) { mutate(id) { $0.focusModes = names } }
+    /// Save one app's preferences and re-render every dock (they share per-app settings).
+    func setAppPrefs(_ appPath: String, _ prefs: AppPrefs) {
+        config.apps[appPath] = prefs == AppPrefs() ? nil : prefs
+        try? store.save(config)
+        let running = activity.snapshot()
+        controllers.values.forEach { $0.appPrefs = config.apps; $0.refreshItems(running: running) }
+        onStateChanged?()
+    }
+
+    func setAccess(_ change: (inout AccessPrefs) -> Void) {
+        change(&config.global.access)
+        persistAndReconcile()
+    }
+
+    func setShowForApps(_ id: UUID, _ paths: [String]) {
+        mutate(id) { $0.showForApps = paths }
+    }
+
 
     func setMirrorsSystemDock(_ id: UUID, _ on: Bool) {
         mutate(id) { $0.mirrorsSystemDock = on }
@@ -202,9 +255,6 @@ final class DockmanController: ObservableObject {
         if changed { persistAndReconcile() }
     }
 
-    func setRevealDelay(_ id: UUID, _ s: Double) { mutate(id) { $0.behavior.revealDelay = s } }
-    func setCollapsed(_ id: UUID, _ on: Bool) { mutate(id) { $0.behavior.collapsed = on } }
-    func setFloating(_ id: UUID, _ on: Bool) { mutate(id) { $0.appearance.floating = on } }
 
     // MARK: - Auto-hide cursor tracking
 
@@ -246,32 +296,26 @@ final class DockmanController: ObservableObject {
     func dock(_ id: UUID) -> DockModel? { config.docks.first { $0.id == id } }
 
     /// Mutate a single Dock then persist + reconcile.
-    private func mutate(_ id: UUID, _ change: (inout DockModel) -> Void) {
+    func mutate(_ id: UUID, _ change: (inout DockModel) -> Void) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
         change(&config.docks[index])
         persistAndReconcile()
     }
 
-    func setBinding(_ id: UUID, _ binding: Binding) { mutate(id) { $0.binding = binding } }
-    func setDockAllSpaces(_ id: UUID) { mutate(id) { $0.binding = .allSpaces } }
-    func setEnabled(_ id: UUID, _ on: Bool) { mutate(id) { $0.enabled = on } }
     func toggleDock(_ id: UUID) { mutate(id) { $0.enabled.toggle() } }
     func renameDock(_ id: UUID, _ name: String) { mutate(id) { $0.name = name } }
-    func setAutoHide(_ id: UUID, _ on: Bool) { mutate(id) { $0.behavior.autoHide = on } }
-    func setShowOverFullscreen(_ id: UUID, _ on: Bool) { mutate(id) { $0.behavior.showOverFullscreen = on } }
-    func setIconSize(_ id: UUID, _ size: Double) { mutate(id) { $0.appearance.iconSize = size } }
-    func setEdge(_ id: UUID, _ edge: Appearance.Edge) { mutate(id) { $0.appearance.edge = edge } }
-    func setStyle(_ id: UUID, _ style: Appearance.Style) { mutate(id) { $0.appearance.style = style } }
-    func setTint(_ id: UUID, _ hex: String?) { mutate(id) { $0.appearance.tintHex = hex } }
-    func setMagnification(_ id: UUID, _ on: Bool) { mutate(id) { $0.appearance.magnification = on } }
-    func setMagnificationScale(_ id: UUID, _ scale: Double) { mutate(id) { $0.appearance.magnificationScale = scale } }
-    func setPadding(_ id: UUID, _ points: Double) { mutate(id) { $0.appearance.padding = points } }
-    func setEdgeGap(_ id: UUID, _ points: Double) { mutate(id) { $0.appearance.edgeGap = points } }
 
     // Item management (Settings "Items" editor + dock context menus).
-    func moveItems(_ id: UUID, from: IndexSet, to: Int) { mutate(id) { $0.items.move(fromOffsets: from, toOffset: to) } }
-    func removeItems(_ id: UUID, at offsets: IndexSet) { mutate(id) { $0.items.remove(atOffsets: offsets) } }
+    func moveItems(_ id: UUID, from: IndexSet, to: Int) {
+        recordUndo()
+        mutate(id) { $0.items.move(fromOffsets: from, toOffset: to) }
+    }
+    func removeItems(_ id: UUID, at offsets: IndexSet) {
+        recordUndo()
+        mutate(id) { $0.items.remove(atOffsets: offsets) }
+    }
     func appendItem(_ id: UUID, _ item: ConfigKit.DockItem) {
+        recordUndo()
         mutate(id) {
             // At most one running-apps zone per dock — a second would render every
             // running app twice.
@@ -299,14 +343,13 @@ final class DockmanController: ObservableObject {
         persistAndReconcile()
     }
 
-    func setCornerRadius(_ id: UUID, _ r: Double) { mutate(id) { $0.appearance.cornerRadius = r } }
-    func setBackgroundOpacity(_ id: UUID, _ o: Double) { mutate(id) { $0.appearance.backgroundOpacity = o } }
     func applyTheme(_ id: UUID, _ theme: Appearance.Theme) { mutate(id) { $0.appearance.apply(theme) } }
 
     /// Copy a dock (items, look, behaviour, placement) under a new id, right after the original.
     @discardableResult
     func duplicateDock(_ id: UUID) -> UUID? {
         guard let i = index(of: id) else { return nil }
+        recordUndo()
         var copy = config.docks[i]
         copy.id = UUID()
         copy.name = config.docks[i].name + " Copy"
@@ -327,11 +370,13 @@ final class DockmanController: ObservableObject {
     func importDocks(from url: URL) throws {
         let imported = try JSONDecoder().decode(Config.self, from: Data(contentsOf: url))
         guard !imported.docks.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        recordUndo()
         config.docks = imported.docks
         persistAndReconcile()
     }
 
     func deleteDock(_ id: UUID) {
+        recordUndo()
         config.docks.removeAll { $0.id == id }
         persistAndReconcile()
     }
@@ -356,7 +401,7 @@ final class DockmanController: ObservableObject {
         if config.global.hideSystemDock { SystemDock.hide() }
     }
 
-    private func persistAndReconcile() {
+    func persistAndReconcile() {
         try? store.save(config)
         reconcileAll()
     }
@@ -368,6 +413,8 @@ final class DockmanController: ObservableObject {
         let id = dock.id
         controller.onModelEdited = { [weak self] edited in self?.updateDockFromDock(id, edited) }
         controller.onActionCommand = { [weak self] action in self?.runActionCommand(action) }
+        controller.onFocusNextDock = { [weak self] in self?.focusNextDock() }
+        controller.onAppPrefsEdited = { [weak self] path, prefs in self?.setAppPrefs(path, prefs) }
         controllers[id] = controller
         return controller
     }
@@ -385,6 +432,7 @@ final class DockmanController: ObservableObject {
     /// position). The Dock already re-rendered, so no re-pin is needed.
     private func updateDockFromDock(_ id: UUID, _ edited: DockModel) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
+        if config.docks[index].items != edited.items { recordUndo() }
         config.docks[index].items = edited.items
         config.docks[index].customIcons = edited.customIcons
         config.docks[index].behavior.collapsed = edited.behavior.collapsed

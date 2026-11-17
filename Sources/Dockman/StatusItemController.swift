@@ -50,6 +50,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let undo = NSMenuItem(title: "Undo Dock Change", action: controller.canUndo ? #selector(undoChange) : nil, keyEquivalent: "z")
+        undo.target = self
+        menu.addItem(undo)
+        let redo = NSMenuItem(title: "Redo Dock Change", action: controller.canRedo ? #selector(redoChange) : nil, keyEquivalent: "Z")
+        redo.target = self
+        menu.addItem(redo)
+        let profiles = NSMenuItem(title: "Profiles", action: nil, keyEquivalent: "")
+        profiles.submenu = makeProfilesMenu()
+        menu.addItem(profiles)
+        menu.addItem(.separator())
         addItem(to: menu, title: "Settings…", key: ",", action: #selector(openSettings))
         addItem(to: menu, title: "Welcome Guide", key: "", action: #selector(showWelcome))
         addItem(to: menu, title: "New Dock on This Desktop", key: "n", action: #selector(newDock))
@@ -60,6 +70,55 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(login)
         menu.addItem(.separator())
         addItem(to: menu, title: "Quit Dockman", key: "q", action: #selector(quit))
+    }
+
+    private func makeProfilesMenu() -> NSMenu {
+        let sub = NSMenu()
+        for profile in controller.config.profiles {
+            let item = NSMenuItem(title: profile.name, action: #selector(switchProfile(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = profile.name
+            item.state = profile.docks == controller.config.docks ? .on : .off
+            sub.addItem(item)
+            let del = NSMenuItem(title: "Delete “\(profile.name)”", action: #selector(deleteProfile(_:)), keyEquivalent: "")
+            del.target = self
+            del.representedObject = profile.name
+            del.isAlternate = true
+            del.keyEquivalentModifierMask = .option
+            sub.addItem(del)
+        }
+        if !controller.config.profiles.isEmpty { sub.addItem(.separator()) }
+        let save = NSMenuItem(title: "Save Current Docks as Profile…", action: #selector(saveProfile), keyEquivalent: "")
+        save.target = self
+        sub.addItem(save)
+        if !controller.config.profiles.isEmpty {
+            let hint = NSMenuItem(title: "Hold ⌥ to delete a profile", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            sub.addItem(hint)
+        }
+        return sub
+    }
+
+    @objc private func undoChange() { controller.undo() }
+    @objc private func redoChange() { controller.redo() }
+    @objc private func switchProfile(_ sender: NSMenuItem) {
+        if let name = sender.representedObject as? String { controller.switchToProfile(name) }
+    }
+    @objc private func deleteProfile(_ sender: NSMenuItem) {
+        if let name = sender.representedObject as? String { controller.deleteProfile(name) }
+    }
+    @objc private func saveProfile() {
+        let alert = NSAlert()
+        alert.messageText = "Save Profile"
+        alert.informativeText = "Saves all your docks as they are now. A profile with the same name is replaced."
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.placeholderString = "e.g. Design, Coding"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { controller.saveProfile(named: input.stringValue) }
     }
 
     private func makeDockSubmenu(for dock: DockModel, orphaned: Bool) -> NSMenu {

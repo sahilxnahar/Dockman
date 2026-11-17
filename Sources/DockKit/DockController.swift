@@ -26,6 +26,9 @@ public final class DockController {
     public var onModelEdited: ((DockModel) -> Void)?
     /// An action item issued a dockman command (handled at app level).
     public var onActionCommand: ((DockAction) -> Void)?
+    /// Per-app preferences (global, shared by all docks) and their edit callback.
+    public var appPrefs: [String: AppPrefs] = [:]
+    public var onAppPrefsEdited: ((String, AppPrefs) -> Void)?
 
     private var lastRunning: [RunningAppInfo] = []
 
@@ -63,9 +66,17 @@ public final class DockController {
 
     private func configure(_ view: DockContentView, maxLength maxLen: CGFloat) {
         view.customIcons = model.customIcons
+        view.appPrefs = appPrefs
+        view.locked = model.appearance.locked
+        view.rows = model.appearance.rows
+        view.hoverEffect = model.appearance.hoverEffect
+        view.launchEffect = model.appearance.launchEffect
+        view.motionSpeed = CGFloat(model.appearance.motionSpeed)
         view.collapsed = model.behavior.collapsed
         view.setAccessibilityLabel("\(model.name) dock")
-        view.configure(items: model.items, iconSize: CGFloat(model.appearance.iconSize),
+        // Big targets: never smaller than 64 px.
+        let size = DockAccess.prefs.bigTargets ? max(model.appearance.iconSize, 64) : model.appearance.iconSize
+        view.configure(items: model.items, iconSize: CGFloat(size),
                        running: lastRunning, vertical: model.appearance.edge.isVertical, maxLength: maxLen,
                        style: model.appearance.style, tintHex: model.appearance.tintHex,
                        edge: model.appearance.edge, magnify: model.appearance.magnification,
@@ -134,7 +145,7 @@ public final class DockController {
                 panel.ignoresMouseEvents = false
                 panel.contentView?.layer?.sublayerTransform = CATransform3DIdentity
             }
-            panel.isMovableByWindowBackground = model.appearance.floating
+            panel.isMovableByWindowBackground = model.appearance.floating && !model.appearance.locked
             observeFloatingMoves(panel, uuid: uuid)
 
             // All-spaces docks use the public path; pinned docks omit it.
@@ -276,14 +287,28 @@ public final class DockController {
         }
     }
 
-    /// Translation that tucks the contents against (into) the Dock's screen edge.
-    static func hiddenOffset(edge: Appearance.Edge, size: NSSize) -> CATransform3D {
-        switch edge {
-        case .bottom: return CATransform3DMakeTranslation(0, -size.height * 0.6, 0)
-        case .top:    return CATransform3DMakeTranslation(0, size.height * 0.6, 0)
-        case .left:   return CATransform3DMakeTranslation(-size.width * 0.6, 0, 0)
-        case .right:  return CATransform3DMakeTranslation(size.width * 0.6, 0, 0)
+    // MARK: - Keyboard focus
+
+    public var onFocusNextDock: (() -> Void)?
+
+    /// Give this Dock keyboard focus on the screen under the cursor (or any visible one).
+    /// Returns false when the Dock isn't showing on the current desktop.
+    @discardableResult
+    public func beginKeyboardFocus() -> Bool {
+        let visible = windows.filter { $0.value.isOnActiveSpace && $0.value.isVisible }
+        let mouse = NSEvent.mouseLocation
+        guard let (uuid, panel) = visible.first(where: { screen(for: $0.key)?.frame.contains(mouse) == true }) ?? visible.first,
+              let view = views[uuid] else { return false }
+        if autoHides { reveal(uuid: uuid) }
+        panel.allowsKeyboardFocus = true
+        panel.makeKeyAndOrderFront(nil)
+        view.onKeyboardFocusEnded = { [weak self, weak panel] in
+            panel?.allowsKeyboardFocus = false
+            if let self, self.autoHides { self.scheduleHide(uuid: uuid) }
         }
+        view.onFocusNextDock = { [weak self] in self?.onFocusNextDock?() }
+        view.beginKeyboardFocus()
+        return true
     }
 
     /// Floating islands: remember where the user dragged them (as fractions of the
@@ -318,17 +343,6 @@ public final class DockController {
         NSScreen.screens.first { Self.uuid(for: $0) == uuid }
     }
 
-    /// The thin edge strip whose entry reveals a hidden Dock.
-    static func revealZone(edge: Appearance.Edge, revealed: NSRect, screenFrame s: NSRect) -> NSRect {
-        let t: CGFloat = 4
-        switch edge {
-        case .bottom: return NSRect(x: revealed.minX - 8, y: s.minY, width: revealed.width + 16, height: t)
-        case .top:    return NSRect(x: revealed.minX - 8, y: s.maxY - t, width: revealed.width + 16, height: t)
-        case .left:   return NSRect(x: s.minX, y: revealed.minY - 8, width: t, height: revealed.height + 16)
-        case .right:  return NSRect(x: s.maxX - t, y: revealed.minY - 8, width: t, height: revealed.height + 16)
-        }
-    }
-
     /// Current Space on a given display, honoring DHSS topology.
     private func currentSpaceInfo(displayUUID: String, topology: SpacesTopology) -> SpaceInfo? {
         if topology.spansDisplays { return topology.displays.first?.currentSpace }
@@ -340,6 +354,10 @@ public final class DockController {
     private func wireView(_ view: DockContentView, uuid: String) {
         view.onActivateItem = { [weak self] item in self?.activate(item, fromDisplay: uuid) }
         view.onRunAction = { [weak self] action in self?.run(action) }
+        view.onSummonApp = { [weak self] path in
+            guard let self, let screen = self.screen(for: uuid) else { return }
+            AXWindowControl.summon(appPath: path, toScreen: screen)
+        }
         view.onItemsChanged = { [weak self] items in
             guard let self else { return }
             var edited = self.model
@@ -348,6 +366,7 @@ public final class DockController {
             self.onModelEdited?(edited)        // persist upstream
             self.refreshItems(running: self.lastRunning)
         }
+        view.onAppPrefsChanged = { [weak self] path, prefs in self?.onAppPrefsEdited?(path, prefs) }
         view.onToggleCollapsed = { [weak self] in
             guard let self else { return }
             var edited = self.model
@@ -418,29 +437,6 @@ public final class DockController {
         let displayID = CGDirectDisplayID(number.uint32Value)
         guard let cf = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else { return nil }
         return CFUUIDCreateString(nil, cf) as String?
-    }
-
-    static func frame(for appearance: Appearance, size: NSSize, screenFrame f: NSRect) -> NSRect {
-        let margin = CGFloat(appearance.edgeGap)
-        // Never let the Dock exceed its own display, or it would spill onto an
-        // adjacent one (one desktop's dock must never appear on another).
-        let w = min(size.width, f.width)
-        let h = min(size.height, f.height)
-        var rect: NSRect
-        if appearance.floating {
-            return NSRect(x: f.minX + (f.width - w) * appearance.floatX,
-                          y: f.minY + (f.height - h) * appearance.floatY, width: w, height: h)
-        }
-        switch appearance.edge {
-        case .bottom: rect = NSRect(x: f.midX - w / 2, y: f.minY + margin, width: w, height: h)
-        case .top:    rect = NSRect(x: f.midX - w / 2, y: f.maxY - margin - h, width: w, height: h)
-        case .left:   rect = NSRect(x: f.minX + margin, y: f.midY - h / 2, width: w, height: h)
-        case .right:  rect = NSRect(x: f.maxX - margin - w, y: f.midY - h / 2, width: w, height: h)
-        }
-        // Clamp fully inside the display bounds as a final safety net.
-        rect.origin.x = min(max(rect.origin.x, f.minX), f.maxX - w)
-        rect.origin.y = min(max(rect.origin.y, f.minY), f.maxY - h)
-        return rect
     }
 
     /// Max Dock length (along its axis) that fits on a display, leaving edge margins.

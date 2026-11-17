@@ -55,6 +55,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <!-- Faceless agent: no system-Dock icon, no app menu. -->
   <key>LSUIElement</key>             <true/>
   <key>NSHighResolutionCapable</key> <true/>
+  <!-- Next Event widget (EventKit). macOS shows this text when asking for access. -->
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Dockman shows your next calendar event in the Next Event widget.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>

@@ -15,11 +15,39 @@ public final class DockContentView: NSView {
     public var onCustomIconChanged: ((_ path: String, _ spec: String?) -> Void)?
     /// Per-item icon overrides keyed by path (see `DockModel.customIcons`).
     public var customIcons: [String: String] = [:]
+    /// Per-app preferences (pinned commands, …) keyed by bundle path.
+    public var appPrefs: [String: AppPrefs] = [:]
+    /// user changed an app's preferences from the Dock menu — persist upstream.
+    public var onAppPrefsChanged: ((_ appPath: String, _ prefs: AppPrefs) -> Void)?
     /// Folded to a single expand button (see `Behavior.collapsed`).
     public var collapsed = false
     /// user asked to collapse/expand the Dock — persist upstream.
     public var onToggleCollapsed: (() -> Void)?
     private var renderedCollapsed: Bool?
+    /// Number of rows (columns on a side dock); >1 wraps items instead of one long bar.
+    public var rows = 1
+    /// Per-dock motion style, handed to each cell.
+    public var hoverEffect: Appearance.HoverEffect = .grow
+    public var launchEffect: Appearance.LaunchEffect = .bounce
+    public var motionSpeed: CGFloat = 1
+    /// The row stacks inside `stack` (one per row).
+    private var rowStacks: [NSStackView] { stack.arrangedSubviews.compactMap { $0 as? NSStackView } }
+    /// Every rendered cell across all rows, in model order.
+    var allCells: [NSView] { rowStacks.flatMap(\.arrangedSubviews) }
+    /// Layout frozen: no reordering by drag.
+    public var locked = false
+    /// Click action "Bring Windows Here" for one app, regardless of the dock's setting.
+    public var onSummonApp: ((String) -> Void)?
+    /// Keyboard navigation state (see DockContentView+Keyboard).
+    var keyboardIndex: Int?
+    var typeBuffer = ""
+    var lastTypeTime = Date.distantPast
+    public var onKeyboardFocusEnded: (() -> Void)?
+    public var onFocusNextDock: (() -> Void)?
+    var activeAppPath: String?
+    private var appliedHighContrast: Bool?
+    var scrollAccum: CGFloat = 0
+    var lastCycle = Date.distantPast
 
     static let gap: CGFloat = 8
     static let internalType = NSPasteboard.PasteboardType("xyz.waqas.dockman.itemindex")
@@ -28,11 +56,11 @@ public final class DockContentView: NSView {
     let stack = NSStackView()
     private var styleWrapper: NSView?
     private(set) var items: [DockItem] = []
-    private var iconSize: CGFloat = 52
+    private(set) var iconSize: CGFloat = 52
     private var padding: CGFloat = CGFloat(Appearance.defaultPadding)
     private(set) var vertical = false
     private(set) var edge: Appearance.Edge = .bottom
-    private var magnify = false
+    private(set) var magnify = false
     private var magnifyScale: CGFloat = CGFloat(Appearance.defaultMagnificationScale)
     var folderPopover: NSPopover?
     private var magnifyTracking: NSTrackingArea?
@@ -55,6 +83,15 @@ public final class DockContentView: NSView {
         setup()
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    public override var acceptsFirstResponder: Bool { keyboardIndex != nil }
+    public override func keyDown(with event: NSEvent) {
+        if !handleKey(event) { super.keyDown(with: event) }
+    }
+    public override func resignFirstResponder() -> Bool {
+        endKeyboardFocus(returnToApp: false)
+        return super.resignFirstResponder()
+    }
 
     private func setup() {
         wantsLayer = true
@@ -155,6 +192,14 @@ public final class DockContentView: NSView {
             wrapper = NSView()
         }
 
+        // High contrast: an outline so the bar's edge is clear on any wallpaper.
+        appliedHighContrast = DockAccess.highContrast
+        if DockAccess.highContrast, effective != .minimal {
+            wrapper.wantsLayer = true
+            wrapper.layer?.borderWidth = 2
+            wrapper.layer?.borderColor = NSColor.labelColor.cgColor
+            wrapper.layer?.cornerRadius = radius
+        }
         wrapper.alphaValue = backgroundOpacity
         wrapper.translatesAutoresizingMaskIntoConstraints = false
         addSubview(wrapper, positioned: .below, relativeTo: contentHolder)
@@ -195,6 +240,7 @@ public final class DockContentView: NSView {
         self.iconSize = iconSize
         self.vertical = vertical
         self.edge = edge
+        let magnify = magnify && rows <= 1        // magnification is a single-row effect
         self.magnify = magnify
         self.magnifyScale = magnifyScale
         self.padding = padding
@@ -203,14 +249,16 @@ public final class DockContentView: NSView {
         let headroom = Magnifier.headroom(iconSize: iconSize, enabled: magnify, maxScale: magnifyScale)
         if style != appliedStyle || tintHex != appliedTint || reduce != appliedReduceTransparency
             || edge != appliedEdge || magnify != appliedMagnify || magnifyScale != appliedMagnifyScale
-            || min(cornerRadius, (iconSize + DockItemCell.dotZone + padding * 2) / 2) != appliedCorner {
+            || min(cornerRadius, (iconSize + DockItemCell.dotZone + padding * 2) / 2) != appliedCorner
+            || DockAccess.highContrast != appliedHighContrast {
             applyStyle(style, tintHex: tintHex, headroom: headroom)
         }
-        styleWrapper?.alphaValue = backgroundOpacity
+        styleWrapper?.alphaValue = DockAccess.highContrast ? 1 : backgroundOpacity
         updateTrackingAreas()   // install/tear down the cursor-move area as magnify toggles
 
-        stack.orientation = vertical ? .vertical : .horizontal
-        stack.alignment = vertical ? .centerX : .centerY
+        // `stack` holds the rows; rows run along the edge, so the stack runs across it.
+        stack.orientation = vertical ? .horizontal : .vertical
+        stack.alignment = vertical ? .centerY : .centerX
         if let renderedCollapsed, renderedCollapsed != collapsed,
            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             let fade = CATransition()                     // crossfade between bar and button
@@ -221,17 +269,20 @@ public final class DockContentView: NSView {
         }
         renderedCollapsed = collapsed
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        var views: [NSView] = []
+        defer { layoutRows(views) }
         if collapsed {
-            stack.addArrangedSubview(makeExpandButton())
+            views.append(makeExpandButton())
             return
         }
 
         let runningPaths = Set(running.compactMap { $0.bundlePath })
+        activeAppPath = running.first(where: \.isActive)?.bundlePath
         let pinnedPaths = Set(items.compactMap { $0.appPath })
 
         // Budget so the Dock never grows past its display (docs/05 R-7). Pinned items
         // always show; the dynamic running-apps zone fills whatever room is left.
-        let budget = maxLength.isFinite ? maxLength - lengthPad * 2 : .greatestFiniteMagnitude
+        let budget = maxLength.isFinite ? (maxLength - lengthPad * 2) * CGFloat(max(rows, 1)) : .greatestFiniteMagnitude
         let separatorLen = DockGapCell.separatorLength
         // A cell is iconSize wide but iconSize+10 tall (the running-indicator dot), so
         // its length along the stack axis differs between orientations.
@@ -245,18 +296,18 @@ public final class DockContentView: NSView {
         for (index, item) in items.enumerated() {
             switch item {
             case .app, .file, .folder, .action, .widget:
-                stack.addArrangedSubview(makeCell(item: item, modelIndex: index, running: runningPaths))
+                views.append(makeCell(item: item, modelIndex: index, running: runningPaths))
                 consume(cellLen)
             case .separator:
-                stack.addArrangedSubview(makeGapCell(item: item, modelIndex: index, length: separatorLen))
+                views.append(makeGapCell(item: item, modelIndex: index, length: separatorLen))
                 consume(separatorLen)
             case .spacer(let points):
-                stack.addArrangedSubview(makeGapCell(item: item, modelIndex: index, length: CGFloat(points)))
+                views.append(makeGapCell(item: item, modelIndex: index, length: CGFloat(points)))
                 consume(CGFloat(points))
             case .runningAppsZone:
                 let zoneApps = RunningZone.apps(running: running, pinnedAppPaths: pinnedPaths)
                 if (!pinnedPaths.isEmpty || !zoneApps.isEmpty), wouldFit(separatorLen) {
-                    stack.addArrangedSubview(makeZoneDivider()); consume(separatorLen)
+                    views.append(makeZoneDivider()); consume(separatorLen)
                 }
                 for app in zoneApps {
                     guard let path = app.bundlePath else { continue }
@@ -264,11 +315,25 @@ public final class DockContentView: NSView {
                     let synthetic = DockItem.app(bundlePath: path, label: app.name)
                     let cell = makeCell(item: synthetic, modelIndex: nil, running: runningPaths)
                     cell.isRunning = true
-                    stack.addArrangedSubview(cell)
+                    views.append(cell)
                     consume(cellLen)
                 }
             }
         }
+    }
+
+    /// Split `views` evenly into `rows` rows (first row nearest the top/left).
+    private func layoutRows(_ views: [NSView]) {
+        let count = max(1, min(rows, views.count))
+        let perRow = Int((Double(views.count) / Double(count)).rounded(.up))
+        for r in 0..<count {
+            let row = NSStackView(views: Array(views.dropFirst(r * perRow).prefix(perRow)))
+            row.orientation = vertical ? .vertical : .horizontal
+            row.alignment = vertical ? .centerX : .centerY
+            row.spacing = Self.gap
+            stack.addArrangedSubview(row)
+        }
+        stack.spacing = Self.gap
     }
 
     /// Margin at the bar's two ends (along its length). Slightly larger than the
@@ -315,13 +380,13 @@ public final class DockContentView: NSView {
 
     public override func mouseExited(with event: NSEvent) {
         guard magnify else { return }
-        for case let cell as DockItemCell in stack.arrangedSubviews { cell.setMagnification(1) }
+        for case let cell as DockItemCell in allCells { cell.setMagnification(1) }
     }
 
     private func magnify(towardCursor p: NSPoint) {
         let cursor = vertical ? p.y : p.x
         let stride = iconSize + Self.gap
-        for case let cell as DockItemCell in stack.arrangedSubviews {
+        for case let cell as DockItemCell in allCells {
             let f = cell.convert(cell.bounds, to: self)
             let center = vertical ? f.midY : f.midX
             cell.setMagnification(Magnifier.scale(distance: cursor - center, stride: stride,
@@ -329,143 +394,19 @@ public final class DockContentView: NSView {
         }
     }
 
-    // MARK: Cell construction
-
-    private func makeCell(item: DockItem, modelIndex: Int?, running: Set<String>) -> DockItemCell {
-        let cell = DockItemCell(item: item, modelIndex: modelIndex, iconSize: iconSize, edge: edge,
-                                customIcon: item.path.flatMap { customIcons[$0] })
-        cell.magnificationEnabled = magnify
-        if let path = item.path { cell.isRunning = running.contains(path) }
-        if let path = item.appPath { cell.badgeText = DockBadges.current[URL(fileURLWithPath: path).standardizedFileURL.path] }
-        cell.onActivate = { [weak self, weak cell] in
-            guard let self, let cell else { return }
-            self.activate(item: item, from: cell)
-        }
-        cell.onContextMenu = { [weak self, weak cell] event in
-            guard let self, let cell else { return }
-            self.showContextMenu(for: cell, event: event)
-        }
-        cell.onBeginDrag = { [weak self] cell, event in
-            self?.beginReorderDrag(cell: cell, event: event)
-        }
-        return cell
-    }
-
-    /// A user-managed separator or spacer: draggable to reorder, right-click to remove.
-    private func makeGapCell(item: DockItem, modelIndex: Int, length: CGFloat) -> DockGapCell {
-        let cell = DockGapCell(item: item, modelIndex: modelIndex,
-                               length: max(length, 1), cross: iconSize * 0.7, vertical: vertical)
-        cell.onContextMenu = { [weak self, weak cell] event in
-            guard let self, let cell else { return }
-            self.showGapContextMenu(for: cell, event: event)
-        }
-        cell.onBeginDrag = { [weak self] cell, event in
-            self?.beginReorderDrag(view: cell, modelIndex: cell.modelIndex, event: event)
-        }
-        return cell
-    }
-
-    /// The lone button a collapsed Dock shows; its chevron points into the screen.
-    private func makeExpandButton() -> NSButton {
-        let symbol: String
-        switch edge {
-        case .bottom: symbol = "chevron.compact.up"
-        case .top:    symbol = "chevron.compact.down"
-        case .left:   symbol = "chevron.compact.right"
-        case .right:  symbol = "chevron.compact.left"
-        }
-        let config = NSImage.SymbolConfiguration(pointSize: iconSize * 0.4, weight: .semibold)
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Expand Dock")?
-            .withSymbolConfiguration(config) ?? NSImage()
-        let button = NSButton(image: image, target: self, action: #selector(toggleCollapsed))
-        button.isBordered = false
-        button.contentTintColor = .secondaryLabelColor
-        button.setAccessibilityLabel("Expand Dock")
-        button.toolTip = "Expand Dock"
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: iconSize).isActive = true
-        button.heightAnchor.constraint(equalToConstant: iconSize + DockItemCell.dotZone).isActive = true
-        return button
-    }
-
-    @objc func toggleCollapsed() {
-        HoverLabel.shared.hide()
-        onToggleCollapsed?()
-    }
-
-    /// The synthetic hairline before the running-apps zone. Not a model item, so inert.
-    private func makeZoneDivider() -> NSView {
-        let box = NSBox()
-        box.boxType = .separator
-        box.translatesAutoresizingMaskIntoConstraints = false
-        // A horizontal stack needs a vertical separator and vice-versa.
-        if vertical {
-            box.widthAnchor.constraint(equalToConstant: iconSize * 0.7).isActive = true
-        } else {
-            box.heightAnchor.constraint(equalToConstant: iconSize * 0.7).isActive = true
-        }
-        return box
-    }
-
-    // MARK: Activation
-
-    func activate(item: DockItem, from cell: DockItemCell) {
-        switch item {
-        case .folder(let path, _, let style):
-            showFolderPopover(path: path, style: style, from: cell)
-        case .action(let action):
-            onRunAction?(action)
-        case .widget(.shelf):
-            let stack = FolderStackView(path: DockWidgets.shelfDirectory.path, style: .grid,
-                                        emptyText: "Drop files here to park them")
-            stack.onDraggedOut = { [weak self] link in
-                try? FileManager.default.removeItem(at: link)   // un-park: removes the link only
-                self?.folderPopover?.performClose(nil)
-            }
-            showStack(stack, from: cell)
-        case .widget(.recents):
-            DockWidgets.recentItems { [weak self, weak cell] urls in
-                guard let self, let cell, cell.window != nil else { return }
-                self.showStack(FolderStackView(urls: urls, style: .list, emptyText: "Nothing opened recently"), from: cell)
-            }
-        case .widget(let kind):
-            DockWidgets.open(kind)
-        case .app where Self.runningApp(for: item) == nil:
-            cell.startBounce()
-            onActivateItem?(item)
-        default:
-            onActivateItem?(item)
-        }
-    }
-
-    private func showFolderPopover(path: String, style: FolderStyle, from cell: NSView) {
-        showStack(FolderStackView(path: path, style: style), from: cell)
-    }
-
-    func showStack(_ content: FolderStackView, from cell: NSView) {
-        folderPopover?.performClose(nil)
-        let popover = NSPopover()
-        popover.behavior = .transient
-        content.onOpen = { [weak popover] url in
-            NSWorkspace.shared.open(url)
-            popover?.performClose(nil)
-        }
-        let vc = NSViewController()
-        vc.view = content
-        popover.contentViewController = vc
-        content.layoutSubtreeIfNeeded()
-        popover.contentSize = content.fittingSize
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: cell.bounds, of: cell, preferredEdge: Self.inwardEdge(edge))
-        folderPopover = popover
-    }
-
     /// Insertion index in `items` for a drop at `cursor` along the length axis.
     /// Collects (modelIndex, center) for every rendered model item — icons AND
     /// separators/spacers — so the index is correct even with gaps in the row.
-    func insertionIndex(at cursor: CGFloat) -> Int {
+    func insertionIndex(at point: NSPoint) -> Int {
+        let cursor = vertical ? point.y : point.x
+        // Multi-row: only the row under the cursor decides the slot.
+        let row = rowStacks.first { r in
+            let f = r.convert(r.bounds, to: self)
+            return vertical ? (point.x >= f.minX - Self.gap && point.x <= f.maxX + Self.gap)
+                            : (point.y >= f.minY - Self.gap && point.y <= f.maxY + Self.gap)
+        } ?? rowStacks.last
         var centers: [(index: Int, center: CGFloat)] = []
-        for view in stack.arrangedSubviews {
+        for view in row?.arrangedSubviews ?? [] {
             let modelIndex: Int?
             if let cell = view as? DockItemCell { modelIndex = cell.modelIndex }
             else if let gap = view as? DockGapCell { modelIndex = gap.modelIndex }
@@ -474,8 +415,11 @@ public final class DockContentView: NSView {
             let f = view.convert(view.bounds, to: self)
             centers.append((modelIndex, vertical ? f.midY : f.midX))
         }
-        return Self.insertionIndex(cursor: cursor, centers: centers,
-                                   descending: vertical, itemCount: items.count)
+        let slot = Self.insertionIndex(cursor: cursor, centers: centers,
+                                       descending: vertical, itemCount: items.count)
+        // Past the end of a row that isn't the last: insert right after that row's last item.
+        if slot == items.count, row !== rowStacks.last, let last = centers.last { return last.index + 1 }
+        return slot
     }
 
     /// Pure insertion computation (unit-tested): the model index of the first item

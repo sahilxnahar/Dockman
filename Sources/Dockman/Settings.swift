@@ -89,6 +89,7 @@ struct DockSettingsView: View {
                         get: { dock.mirrorsSystemDock }, set: { controller.setMirrorsSystemDock(dockID, $0) }))
                         .help("Keep this dock's items in sync with the built-in Dock's apps and folders")
                     focusMenu(dock)
+                    appTriggerMenu(dock)
                 }
 
                 Section("Behavior") {
@@ -128,7 +129,51 @@ struct DockSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("Appearance") {
+                Section("Layout") {
+                    Picker("Position", selection: Binding(
+                        get: { dock.appearance.edge }, set: { controller.setEdge(dockID, $0) })) {
+                        Text("Bottom").tag(Appearance.Edge.bottom)
+                        Text("Top").tag(Appearance.Edge.top)
+                        Text("Left").tag(Appearance.Edge.left)
+                        Text("Right").tag(Appearance.Edge.right)
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Alignment", selection: Binding(
+                        get: { dock.appearance.alignment }, set: { controller.setAlignment(dockID, $0) })) {
+                        let vertical = dock.appearance.edge.isVertical
+                        Text(vertical ? "Top" : "Left").tag(Appearance.Alignment.start)
+                        Text("Center").tag(Appearance.Alignment.center)
+                        Text(vertical ? "Bottom" : "Right").tag(Appearance.Alignment.end)
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(dock.appearance.floating)
+                    Toggle("Floating island (drag anywhere)", isOn: Binding(
+                        get: { dock.appearance.floating }, set: { controller.setFloating(dockID, $0) }))
+                        .help("Drag the dock's background to move it. Position still sets row vs column and which side labels open.")
+                    Stepper(value: Binding(get: { dock.appearance.rows }, set: { controller.setRows(dockID, $0) }), in: 1...4) {
+                        LabeledContent(dock.appearance.edge.isVertical ? "Columns" : "Rows", value: "\(dock.appearance.rows)")
+                    }
+                    .help("Wrap items into several rows instead of one long bar (turns magnification off)")
+                    VStack(alignment: .leading) {
+                        LabeledContent("Margin", value: "\(Int(dock.appearance.padding)) px")
+                        Slider(value: Binding(
+                            get: { dock.appearance.padding },
+                            set: { controller.setPadding(dockID, $0) }), in: 0...32, step: 2)
+                    }
+                    .help("Space between the icons and the edge of the bar")
+                    VStack(alignment: .leading) {
+                        LabeledContent("Screen Edge Gap", value: "\(Int(dock.appearance.edgeGap)) px")
+                        Slider(value: Binding(
+                            get: { dock.appearance.edgeGap },
+                            set: { controller.setEdgeGap(dockID, $0) }), in: 0...64, step: 2)
+                    }
+                    .help("Distance between the bar and the edge of the screen (0 = flush)")
+                    Toggle("Lock layout", isOn: Binding(
+                        get: { dock.appearance.locked }, set: { controller.setLocked(dockID, $0) }))
+                        .help("Stops items being dragged out of order and a floating dock being moved")
+                }
+
+                Section("Look") {
                     Menu("Apply Theme") {
                         ForEach(Appearance.themes, id: \.name) { theme in
                             Button(theme.name) { controller.applyTheme(dockID, theme) }
@@ -141,25 +186,12 @@ struct DockSettingsView: View {
                             Text($0.displayName).tag($0)
                         }
                     }
-                    Picker("Position", selection: Binding(
-                        get: { dock.appearance.edge }, set: { controller.setEdge(dockID, $0) })) {
-                        Text("Bottom").tag(Appearance.Edge.bottom)
-                        Text("Top").tag(Appearance.Edge.top)
-                        Text("Left").tag(Appearance.Edge.left)
-                        Text("Right").tag(Appearance.Edge.right)
-                    }
-                    .pickerStyle(.segmented)
-                    Toggle("Floating island (drag anywhere)", isOn: Binding(
-                        get: { dock.appearance.floating }, set: { controller.setFloating(dockID, $0) }))
-                        .help("Drag the dock's background to move it. Position still sets row vs column and which side labels open.")
-
                     VStack(alignment: .leading) {
                         LabeledContent("Icon Size", value: "\(Int(dock.appearance.iconSize)) px")
                         Slider(value: Binding(
                             get: { dock.appearance.iconSize },
                             set: { controller.setIconSize(dockID, $0) }), in: 24...128, step: 4)
                     }
-
                     Toggle("Magnification", isOn: Binding(
                         get: { dock.appearance.magnification },
                         set: { controller.setMagnification(dockID, $0) }))
@@ -174,30 +206,12 @@ struct DockSettingsView: View {
                         }
                         .help("How large icons grow under the cursor")
                     }
-
-                    VStack(alignment: .leading) {
-                        LabeledContent("Margin", value: "\(Int(dock.appearance.padding)) px")
-                        Slider(value: Binding(
-                            get: { dock.appearance.padding },
-                            set: { controller.setPadding(dockID, $0) }), in: 0...32, step: 2)
-                    }
-                    .help("Space between the icons and the edge of the bar")
-
-                    VStack(alignment: .leading) {
-                        LabeledContent("Screen Edge Gap", value: "\(Int(dock.appearance.edgeGap)) px")
-                        Slider(value: Binding(
-                            get: { dock.appearance.edgeGap },
-                            set: { controller.setEdgeGap(dockID, $0) }), in: 0...64, step: 2)
-                    }
-                    .help("Distance between the bar and the edge of the screen (0 = flush)")
-
                     VStack(alignment: .leading) {
                         LabeledContent("Corner Radius", value: "\(Int(dock.appearance.cornerRadius)) px")
                         Slider(value: Binding(
                             get: { dock.appearance.cornerRadius },
                             set: { controller.setCornerRadius(dockID, $0) }), in: 0...40, step: 1)
                     }
-
                     if dock.appearance.style != .minimal {
                         VStack(alignment: .leading) {
                             LabeledContent("Background Opacity", value: "\(Int(dock.appearance.backgroundOpacity * 100))%")
@@ -206,7 +220,6 @@ struct DockSettingsView: View {
                                 set: { controller.setBackgroundOpacity(dockID, $0) }), in: 0.2...1, step: 0.05)
                         }
                     }
-
                     HStack {
                         Text("Tint")
                         Spacer()
@@ -219,6 +232,31 @@ struct DockSettingsView: View {
                                 .help(name)
                         }
                     }
+                }
+
+                Section("Motion") {
+                    Picker("Hover", selection: Binding(
+                        get: { dock.appearance.hoverEffect }, set: { controller.setHoverEffect(dockID, $0) })) {
+                        Text("Grow").tag(Appearance.HoverEffect.grow)
+                        Text("Lift").tag(Appearance.HoverEffect.lift)
+                        Text("Glow").tag(Appearance.HoverEffect.glow)
+                        Text("None").tag(Appearance.HoverEffect.none)
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("App Launch", selection: Binding(
+                        get: { dock.appearance.launchEffect }, set: { controller.setLaunchEffect(dockID, $0) })) {
+                        Text("Bounce").tag(Appearance.LaunchEffect.bounce)
+                        Text("Pulse").tag(Appearance.LaunchEffect.pulse)
+                        Text("None").tag(Appearance.LaunchEffect.none)
+                    }
+                    .pickerStyle(.segmented)
+                    VStack(alignment: .leading) {
+                        LabeledContent("Speed", value: dock.appearance.motionSpeed < 0.9 ? "Relaxed" : dock.appearance.motionSpeed > 1.2 ? "Snappy" : "Normal")
+                        Slider(value: Binding(get: { dock.appearance.motionSpeed }, set: { controller.setMotionSpeed(dockID, $0) }),
+                               in: 0.5...2, step: 0.1)
+                    }
+                    Text("Animations are skipped when Reduce Motion is on in macOS Accessibility settings.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -276,28 +314,6 @@ struct DockSettingsView: View {
     /// Open-panel flow for "Add Item ▸ App, File, or Folder…". Apps become app
     /// items, other folders become folder stacks, files become file items —
     /// the same classification as dropping from Finder.
-    /// "Show only during Focus": pick any Focus modes; none = always shown.
-    @ViewBuilder private func focusMenu(_ dock: DockModel) -> some View {
-        let modes = controller.focus.modeNames()
-        LabeledContent("Show During Focus") {
-            Menu(dock.focusModes.isEmpty ? "Always" : dock.focusModes.joined(separator: ", ")) {
-                Button("Always (any Focus)") { controller.setFocusModes(dockID, []) }
-                if !modes.isEmpty { Divider() }
-                ForEach(modes, id: \.self) { name in
-                    Button((dock.focusModes.contains(name) ? "✓ " : "") + name) {
-                        var set = dock.focusModes
-                        if let i = set.firstIndex(of: name) { set.remove(at: i) } else { set.append(name) }
-                        controller.setFocusModes(dockID, set)
-                    }
-                }
-            }
-            .fixedSize()
-            .disabled(modes.isEmpty)
-            .help(modes.isEmpty ? "Dockman can't read your Focus modes (Full Disk Access may be needed)"
-                                : "Show this dock only while one of these Focus modes is on")
-        }
-    }
-
     private func browseAndAddItems() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true

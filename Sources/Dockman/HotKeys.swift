@@ -1,7 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// System-wide ⌃⌥1…⌃⌥9 shortcuts, one per Dock (`Behavior.hotkeyDigit`).
+/// System-wide ⌃⌥ shortcuts: 1…9 per Dock (`Behavior.hotkeyDigit`), 0 = keyboard focus, Space = search.
 /// Uses Carbon's RegisterEventHotKey: event-driven, needs no permission, costs nothing idle.
 final class HotKeys {
     private var refs: [EventHotKeyRef] = []
@@ -13,19 +13,24 @@ final class HotKeys {
         6: kVK_ANSI_6, 7: kVK_ANSI_7, 8: kVK_ANSI_8, 9: kVK_ANSI_9,
     ]
 
-    /// Replace all shortcuts with `bindings` (digit → action).
-    func register(_ bindings: [Int: () -> Void]) {
+    /// ⌃⌥0 focuses a dock for keyboard navigation; ⌃⌥Space opens type-to-launch search.
+    static let focusKey = kVK_ANSI_0
+    static let searchKey = kVK_Space
+
+    /// Replace all shortcuts: `digits` (1–9 → action) plus fixed ⌃⌥ keys (key code → action).
+    func register(_ digits: [Int: () -> Void], fixed: [Int: () -> Void] = [:]) {
         unregisterAll()
-        guard !bindings.isEmpty else { return }
+        var all: [(code: Int, action: () -> Void)] = fixed.map { ($0.key, $0.value) }
+        for (digit, action) in digits { if let code = Self.digitKeyCodes[digit] { all.append((code, action)) } }
+        guard !all.isEmpty else { return }
         installHandlerIfNeeded()
-        for (digit, action) in bindings {
-            guard let code = Self.digitKeyCodes[digit] else { continue }
+        for (n, entry) in all.enumerated() {
             var ref: EventHotKeyRef?
-            let id = EventHotKeyID(signature: OSType(0x444B_4D4E), id: UInt32(digit))   // 'DKMN'
-            if RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey), id,
+            let id = EventHotKeyID(signature: OSType(0x444B_4D4E), id: UInt32(n + 1))   // 'DKMN'
+            if RegisterEventHotKey(UInt32(entry.code), UInt32(controlKey | optionKey), id,
                                    GetApplicationEventTarget(), 0, &ref) == noErr, let ref {
                 refs.append(ref)
-                actions[UInt32(digit)] = action
+                actions[UInt32(n + 1)] = entry.action
             }
         }
     }

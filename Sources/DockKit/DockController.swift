@@ -32,7 +32,13 @@ public final class DockController {
     // Auto-hide state, per display window.
     private var revealed: [String: Bool] = [:]
     private var hideWork: [String: DispatchWorkItem] = [:]
+    private var revealWork: [String: DispatchWorkItem] = [:]
+    private var floatSave: DispatchWorkItem?
+    private var moveObservers: [String: NSObjectProtocol] = [:]
     private let hideDelay: TimeInterval = 0.45
+
+    /// Floating islands have no edge to hide against, so auto-hide is off for them.
+    private var autoHides: Bool { model.behavior.autoHide && !model.appearance.floating }
 
     public init(model: DockModel, spaces: SkyLightSpacesService) {
         self.model = model
@@ -50,14 +56,23 @@ public final class DockController {
         lastRunning = running
         for (uuid, view) in views {
             let maxLen = screen(for: uuid).map { maxLength(forScreenFrame: $0.frame) } ?? .greatestFiniteMagnitude
-            view.configure(items: model.items, iconSize: CGFloat(model.appearance.iconSize),
-                           running: running, vertical: model.appearance.edge.isVertical, maxLength: maxLen,
-                           style: model.appearance.style, tintHex: model.appearance.tintHex,
-                           edge: model.appearance.edge, magnify: model.appearance.magnification,
-                           magnifyScale: CGFloat(model.appearance.magnificationScale),
-                           padding: CGFloat(model.appearance.padding))
+            configure(view, maxLength: maxLen)
         }
         resizeWindowsToFit()
+    }
+
+    private func configure(_ view: DockContentView, maxLength maxLen: CGFloat) {
+        view.customIcons = model.customIcons
+        view.collapsed = model.behavior.collapsed
+        view.setAccessibilityLabel("\(model.name) dock")
+        view.configure(items: model.items, iconSize: CGFloat(model.appearance.iconSize),
+                       running: lastRunning, vertical: model.appearance.edge.isVertical, maxLength: maxLen,
+                       style: model.appearance.style, tintHex: model.appearance.tintHex,
+                       edge: model.appearance.edge, magnify: model.appearance.magnification,
+                       magnifyScale: CGFloat(model.appearance.magnificationScale),
+                       padding: CGFloat(model.appearance.padding),
+                       cornerRadius: CGFloat(model.appearance.cornerRadius),
+                       backgroundOpacity: CGFloat(model.appearance.backgroundOpacity))
     }
 
     /// Create/position/pin windows to match `model` against `topology`.
@@ -77,6 +92,7 @@ public final class DockController {
             spaces.unregisterOwnedWindow(CGWindowID(panel.windowNumber))
             panel.orderOut(nil)
             windows[uuid] = nil
+            moveObservers.removeValue(forKey: uuid).map(NotificationCenter.default.removeObserver)
             views[uuid] = nil
         }
 
@@ -99,13 +115,7 @@ public final class DockController {
                 views[uuid] = view
             }
 
-            view.configure(items: model.items, iconSize: CGFloat(model.appearance.iconSize),
-                           running: lastRunning, vertical: model.appearance.edge.isVertical,
-                           maxLength: maxLength(forScreenFrame: screen.frame),
-                           style: model.appearance.style, tintHex: model.appearance.tintHex,
-                           edge: model.appearance.edge, magnify: model.appearance.magnification,
-                           magnifyScale: CGFloat(model.appearance.magnificationScale),
-                           padding: CGFloat(model.appearance.padding))
+            configure(view, maxLength: maxLength(forScreenFrame: screen.frame))
             panel.hasShadow = model.appearance.style != .minimal
             let size = view.fittingSize()
             let revealedFrame = Self.frame(for: model.appearance, size: size, screenFrame: screen.frame)
@@ -113,7 +123,7 @@ public final class DockController {
             // than sliding it off-screen — robust across stacked-display layouts where
             // "below the screen" is another display, not empty space.
             panel.setFrame(revealedFrame, display: true)
-            if model.behavior.autoHide {
+            if autoHides {
                 let shown = revealed[uuid] ?? false
                 panel.alphaValue = shown ? 1 : 0
                 panel.ignoresMouseEvents = !shown
@@ -122,7 +132,10 @@ public final class DockController {
                 hideWork[uuid]?.cancel(); hideWork[uuid] = nil
                 panel.alphaValue = 1
                 panel.ignoresMouseEvents = false
+                panel.contentView?.layer?.sublayerTransform = CATransform3DIdentity
             }
+            panel.isMovableByWindowBackground = model.appearance.floating
+            observeFloatingMoves(panel, uuid: uuid)
 
             // All-spaces docks use the public path; pinned docks omit it.
             if model.binding.mode == .allSpaces {
@@ -173,6 +186,10 @@ public final class DockController {
         }
         hideWork.values.forEach { $0.cancel() }
         hideWork.removeAll()
+        revealWork.values.forEach { $0.cancel() }
+        revealWork.removeAll()
+        moveObservers.values.forEach(NotificationCenter.default.removeObserver)
+        moveObservers.removeAll()
         revealed.removeAll()
         windows.removeAll()
         views.removeAll()
@@ -183,7 +200,7 @@ public final class DockController {
 
     /// Fed the global cursor location; fades auto-hide windows in/out by edge proximity.
     public func handleMouseMoved(_ location: NSPoint) {
-        guard model.enabled, model.behavior.autoHide else { return }
+        guard model.enabled, autoHides else { return }
         for (uuid, panel) in windows {
             guard let screen = screen(for: uuid) else { continue }
             let revealedFrame = panel.frame   // window stays put; only visibility changes
@@ -197,9 +214,23 @@ public final class DockController {
                     scheduleHide(uuid: uuid)
                 }
             } else if zone.contains(location) {
-                reveal(uuid: uuid)
+                scheduleReveal(uuid: uuid)
+            } else {
+                revealWork[uuid]?.cancel(); revealWork[uuid] = nil   // left the edge before the delay ran out
             }
         }
+    }
+
+    private func scheduleReveal(uuid: String) {
+        let delay = model.behavior.revealDelay
+        guard delay > 0 else { reveal(uuid: uuid); return }
+        guard revealWork[uuid] == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.revealWork[uuid] = nil
+            self?.reveal(uuid: uuid)
+        }
+        revealWork[uuid] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func reveal(uuid: String) {
@@ -214,7 +245,7 @@ public final class DockController {
         let work = DispatchWorkItem { [weak self] in
             guard let self, let panel = self.windows[uuid] else { return }
             self.hideWork[uuid] = nil
-            guard self.model.behavior.autoHide else { return }
+            guard self.autoHides else { return }
             self.revealed[uuid] = false
             self.setVisible(panel, false)
         }
@@ -222,12 +253,64 @@ public final class DockController {
         DispatchQueue.main.asyncAfter(deadline: .now() + hideDelay, execute: work)
     }
 
-    /// Fade a window in/out in place (no movement, so it never crosses to another display).
+    /// Slide the Dock's contents toward its screen edge while fading. Only the contents
+    /// move — the window itself stays in place, so it never crosses onto another display.
     private func setVisible(_ panel: NSPanel, _ visible: Bool) {
         panel.ignoresMouseEvents = !visible
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if let layer = panel.contentView?.layer, !reduceMotion {
+            let hidden = Self.hiddenOffset(edge: model.appearance.edge, size: panel.frame.size)
+            let from = visible ? hidden : CATransform3DIdentity
+            let to = visible ? CATransform3DIdentity : hidden
+            let anim = CABasicAnimation(keyPath: "sublayerTransform")
+            anim.fromValue = NSValue(caTransform3D: from)
+            anim.toValue = NSValue(caTransform3D: to)
+            anim.duration = visible ? 0.22 : 0.28
+            anim.timingFunction = CAMediaTimingFunction(name: visible ? .easeOut : .easeIn)
+            layer.sublayerTransform = to
+            layer.add(anim, forKey: "autohide-slide")
+        }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
+            context.duration = visible ? 0.18 : 0.28
             panel.animator().alphaValue = visible ? 1 : 0
+        }
+    }
+
+    /// Translation that tucks the contents against (into) the Dock's screen edge.
+    static func hiddenOffset(edge: Appearance.Edge, size: NSSize) -> CATransform3D {
+        switch edge {
+        case .bottom: return CATransform3DMakeTranslation(0, -size.height * 0.6, 0)
+        case .top:    return CATransform3DMakeTranslation(0, size.height * 0.6, 0)
+        case .left:   return CATransform3DMakeTranslation(-size.width * 0.6, 0, 0)
+        case .right:  return CATransform3DMakeTranslation(size.width * 0.6, 0, 0)
+        }
+    }
+
+    /// Floating islands: remember where the user dragged them (as fractions of the
+    /// display, so the spot survives resolution changes). Saves once the drag settles.
+    private func observeFloatingMoves(_ panel: NSPanel, uuid: String) {
+        guard moveObservers[uuid] == nil else { return }
+        moveObservers[uuid] = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: panel, queue: .main
+        ) { [weak self, weak panel] _ in
+            guard let self, let panel, self.model.appearance.floating,
+                  let f = self.screen(for: uuid)?.frame else { return }
+            let x = f.width > panel.frame.width ? (panel.frame.minX - f.minX) / (f.width - panel.frame.width) : 0.5
+            let y = f.height > panel.frame.height ? (panel.frame.minY - f.minY) / (f.height - panel.frame.height) : 0.5
+            let fx = min(max(Double(x), 0), 1), fy = min(max(Double(y), 0), 1)
+            // Our own setFrame lands exactly on the saved spot: ignore it.
+            guard abs(fx - self.model.appearance.floatX) > 0.001 || abs(fy - self.model.appearance.floatY) > 0.001 else { return }
+            self.floatSave?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                var edited = self.model
+                edited.appearance.floatX = fx
+                edited.appearance.floatY = fy
+                self.model = edited
+                self.onModelEdited?(edited)
+            }
+            self.floatSave = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
         }
     }
 
@@ -263,6 +346,22 @@ public final class DockController {
             edited.items = items
             self.model = edited
             self.onModelEdited?(edited)        // persist upstream
+            self.refreshItems(running: self.lastRunning)
+        }
+        view.onToggleCollapsed = { [weak self] in
+            guard let self else { return }
+            var edited = self.model
+            edited.behavior.collapsed.toggle()
+            self.model = edited
+            self.onModelEdited?(edited)
+            self.refreshItems(running: self.lastRunning)
+        }
+        view.onCustomIconChanged = { [weak self] path, spec in
+            guard let self else { return }
+            var edited = self.model
+            edited.customIcons[path] = spec
+            self.model = edited
+            self.onModelEdited?(edited)
             self.refreshItems(running: self.lastRunning)
         }
     }
@@ -328,6 +427,10 @@ public final class DockController {
         let w = min(size.width, f.width)
         let h = min(size.height, f.height)
         var rect: NSRect
+        if appearance.floating {
+            return NSRect(x: f.minX + (f.width - w) * appearance.floatX,
+                          y: f.minY + (f.height - h) * appearance.floatY, width: w, height: h)
+        }
         switch appearance.edge {
         case .bottom: rect = NSRect(x: f.midX - w / 2, y: f.minY + margin, width: w, height: h)
         case .top:    rect = NSRect(x: f.midX - w / 2, y: f.maxY - margin - h, width: w, height: h)

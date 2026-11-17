@@ -11,21 +11,30 @@ public final class DockContentView: NSView {
     public var onRunAction: ((DockAction) -> Void)?
     /// items changed via add/remove/reorder — persist upstream.
     public var onItemsChanged: (([DockItem]) -> Void)?
+    /// user set (or cleared, nil) a custom icon for the item at `path` — persist upstream.
+    public var onCustomIconChanged: ((_ path: String, _ spec: String?) -> Void)?
+    /// Per-item icon overrides keyed by path (see `DockModel.customIcons`).
+    public var customIcons: [String: String] = [:]
+    /// Folded to a single expand button (see `Behavior.collapsed`).
+    public var collapsed = false
+    /// user asked to collapse/expand the Dock — persist upstream.
+    public var onToggleCollapsed: (() -> Void)?
+    private var renderedCollapsed: Bool?
 
     static let gap: CGFloat = 8
     static let internalType = NSPasteboard.PasteboardType("xyz.waqas.dockman.itemindex")
 
     private let contentHolder = NSView()
-    private let stack = NSStackView()
+    let stack = NSStackView()
     private var styleWrapper: NSView?
-    private var items: [DockItem] = []
+    private(set) var items: [DockItem] = []
     private var iconSize: CGFloat = 52
     private var padding: CGFloat = CGFloat(Appearance.defaultPadding)
-    private var vertical = false
-    private var edge: Appearance.Edge = .bottom
+    private(set) var vertical = false
+    private(set) var edge: Appearance.Edge = .bottom
     private var magnify = false
     private var magnifyScale: CGFloat = CGFloat(Appearance.defaultMagnificationScale)
-    private var folderPopover: NSPopover?
+    var folderPopover: NSPopover?
     private var magnifyTracking: NSTrackingArea?
     /// Bar-region pins for `contentHolder`, rebuilt when edge/headroom change.
     private var holderConstraints: [NSLayoutConstraint] = []
@@ -37,6 +46,9 @@ public final class DockContentView: NSView {
     private var appliedEdge: Appearance.Edge?
     private var appliedMagnify: Bool?
     private var appliedMagnifyScale: CGFloat?
+    private var cornerRadius = CGFloat(Appearance.defaultCornerRadius)
+    private var backgroundOpacity: CGFloat = 1
+    private var appliedCorner: CGFloat?
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -62,6 +74,9 @@ public final class DockContentView: NSView {
         ])
         pinToBarRegion(contentHolder, headroom: 0)
         registerForDraggedTypes([.fileURL, Self.internalType])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.toolbar)
+        setAccessibilityLabel("Dockman dock")
     }
 
     /// Pin `view` to the bar sub-region of `self`: full length along the bar,
@@ -109,7 +124,9 @@ public final class DockContentView: NSView {
         styleWrapper?.removeFromSuperview()
 
         let tint = tintHex.flatMap { NSColor(hex: $0) }
-        let radius: CGFloat = 18
+        // Never round past half the bar's thickness, or the corners would pinch.
+        let thickness = iconSize + DockItemCell.dotZone + padding * 2
+        let radius = min(cornerRadius, thickness / 2)
         // Background-only slab. The icons live in `contentHolder`, a sibling
         // *above* this wrapper, so the wrapper's rounded-corner clipping never
         // touches a magnified icon that has grown past the bar.
@@ -138,6 +155,7 @@ public final class DockContentView: NSView {
             wrapper = NSView()
         }
 
+        wrapper.alphaValue = backgroundOpacity
         wrapper.translatesAutoresizingMaskIntoConstraints = false
         addSubview(wrapper, positioned: .below, relativeTo: contentHolder)
         pinToBarRegion(wrapper, headroom: headroom)
@@ -149,6 +167,7 @@ public final class DockContentView: NSView {
         appliedEdge = edge
         appliedMagnify = magnify
         appliedMagnifyScale = magnifyScale
+        appliedCorner = radius
     }
 
     private func makeVisualEffect(radius: CGFloat) -> NSVisualEffectView {
@@ -167,7 +186,11 @@ public final class DockContentView: NSView {
                           style: Appearance.Style = .classic, tintHex: String? = nil,
                           edge: Appearance.Edge = .bottom, magnify: Bool = false,
                           magnifyScale: CGFloat = CGFloat(Appearance.defaultMagnificationScale),
-                          padding: CGFloat = CGFloat(Appearance.defaultPadding)) {
+                          padding: CGFloat = CGFloat(Appearance.defaultPadding),
+                          cornerRadius: CGFloat = CGFloat(Appearance.defaultCornerRadius),
+                          backgroundOpacity: CGFloat = 1) {
+        self.cornerRadius = cornerRadius
+        self.backgroundOpacity = backgroundOpacity
         self.items = items
         self.iconSize = iconSize
         self.vertical = vertical
@@ -179,14 +202,29 @@ public final class DockContentView: NSView {
         let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         let headroom = Magnifier.headroom(iconSize: iconSize, enabled: magnify, maxScale: magnifyScale)
         if style != appliedStyle || tintHex != appliedTint || reduce != appliedReduceTransparency
-            || edge != appliedEdge || magnify != appliedMagnify || magnifyScale != appliedMagnifyScale {
+            || edge != appliedEdge || magnify != appliedMagnify || magnifyScale != appliedMagnifyScale
+            || min(cornerRadius, (iconSize + DockItemCell.dotZone + padding * 2) / 2) != appliedCorner {
             applyStyle(style, tintHex: tintHex, headroom: headroom)
         }
+        styleWrapper?.alphaValue = backgroundOpacity
         updateTrackingAreas()   // install/tear down the cursor-move area as magnify toggles
 
         stack.orientation = vertical ? .vertical : .horizontal
         stack.alignment = vertical ? .centerX : .centerY
+        if let renderedCollapsed, renderedCollapsed != collapsed,
+           !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let fade = CATransition()                     // crossfade between bar and button
+            fade.type = .fade
+            fade.duration = 0.2
+            contentHolder.wantsLayer = true
+            contentHolder.layer?.add(fade, forKey: "collapse")
+        }
+        renderedCollapsed = collapsed
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        if collapsed {
+            stack.addArrangedSubview(makeExpandButton())
+            return
+        }
 
         let runningPaths = Set(running.compactMap { $0.bundlePath })
         let pinnedPaths = Set(items.compactMap { $0.appPath })
@@ -206,7 +244,7 @@ public final class DockContentView: NSView {
 
         for (index, item) in items.enumerated() {
             switch item {
-            case .app, .file, .folder, .action:
+            case .app, .file, .folder, .action, .widget:
                 stack.addArrangedSubview(makeCell(item: item, modelIndex: index, running: runningPaths))
                 consume(cellLen)
             case .separator:
@@ -294,9 +332,11 @@ public final class DockContentView: NSView {
     // MARK: Cell construction
 
     private func makeCell(item: DockItem, modelIndex: Int?, running: Set<String>) -> DockItemCell {
-        let cell = DockItemCell(item: item, modelIndex: modelIndex, iconSize: iconSize, edge: edge)
+        let cell = DockItemCell(item: item, modelIndex: modelIndex, iconSize: iconSize, edge: edge,
+                                customIcon: item.path.flatMap { customIcons[$0] })
         cell.magnificationEnabled = magnify
         if let path = item.path { cell.isRunning = running.contains(path) }
+        if let path = item.appPath { cell.badgeText = DockBadges.current[URL(fileURLWithPath: path).standardizedFileURL.path] }
         cell.onActivate = { [weak self, weak cell] in
             guard let self, let cell else { return }
             self.activate(item: item, from: cell)
@@ -325,6 +365,34 @@ public final class DockContentView: NSView {
         return cell
     }
 
+    /// The lone button a collapsed Dock shows; its chevron points into the screen.
+    private func makeExpandButton() -> NSButton {
+        let symbol: String
+        switch edge {
+        case .bottom: symbol = "chevron.compact.up"
+        case .top:    symbol = "chevron.compact.down"
+        case .left:   symbol = "chevron.compact.right"
+        case .right:  symbol = "chevron.compact.left"
+        }
+        let config = NSImage.SymbolConfiguration(pointSize: iconSize * 0.4, weight: .semibold)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Expand Dock")?
+            .withSymbolConfiguration(config) ?? NSImage()
+        let button = NSButton(image: image, target: self, action: #selector(toggleCollapsed))
+        button.isBordered = false
+        button.contentTintColor = .secondaryLabelColor
+        button.setAccessibilityLabel("Expand Dock")
+        button.toolTip = "Expand Dock"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: iconSize).isActive = true
+        button.heightAnchor.constraint(equalToConstant: iconSize + DockItemCell.dotZone).isActive = true
+        return button
+    }
+
+    @objc func toggleCollapsed() {
+        HoverLabel.shared.hide()
+        onToggleCollapsed?()
+    }
+
     /// The synthetic hairline before the running-apps zone. Not a model item, so inert.
     private func makeZoneDivider() -> NSView {
         let box = NSBox()
@@ -341,22 +409,43 @@ public final class DockContentView: NSView {
 
     // MARK: Activation
 
-    private func activate(item: DockItem, from cell: DockItemCell) {
+    func activate(item: DockItem, from cell: DockItemCell) {
         switch item {
         case .folder(let path, _, let style):
             showFolderPopover(path: path, style: style, from: cell)
         case .action(let action):
             onRunAction?(action)
+        case .widget(.shelf):
+            let stack = FolderStackView(path: DockWidgets.shelfDirectory.path, style: .grid,
+                                        emptyText: "Drop files here to park them")
+            stack.onDraggedOut = { [weak self] link in
+                try? FileManager.default.removeItem(at: link)   // un-park: removes the link only
+                self?.folderPopover?.performClose(nil)
+            }
+            showStack(stack, from: cell)
+        case .widget(.recents):
+            DockWidgets.recentItems { [weak self, weak cell] urls in
+                guard let self, let cell, cell.window != nil else { return }
+                self.showStack(FolderStackView(urls: urls, style: .list, emptyText: "Nothing opened recently"), from: cell)
+            }
+        case .widget(let kind):
+            DockWidgets.open(kind)
+        case .app where Self.runningApp(for: item) == nil:
+            cell.startBounce()
+            onActivateItem?(item)
         default:
             onActivateItem?(item)
         }
     }
 
     private func showFolderPopover(path: String, style: FolderStyle, from cell: NSView) {
+        showStack(FolderStackView(path: path, style: style), from: cell)
+    }
+
+    func showStack(_ content: FolderStackView, from cell: NSView) {
         folderPopover?.performClose(nil)
         let popover = NSPopover()
         popover.behavior = .transient
-        let content = FolderStackView(path: path, style: style)
         content.onOpen = { [weak popover] url in
             NSWorkspace.shared.open(url)
             popover?.performClose(nil)
@@ -367,124 +456,14 @@ public final class DockContentView: NSView {
         content.layoutSubtreeIfNeeded()
         popover.contentSize = content.fittingSize
         NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: cell.bounds, of: cell, preferredEdge: .maxY)
+        popover.show(relativeTo: cell.bounds, of: cell, preferredEdge: Self.inwardEdge(edge))
         folderPopover = popover
-    }
-
-    // MARK: Context menu
-
-    private func showContextMenu(for cell: DockItemCell, event: NSEvent) {
-        let menu = NSMenu()
-        let isZone = cell.modelIndex == nil
-
-        switch cell.item {
-        case .action:
-            menu.addItem(withTitle: "Run", action: #selector(ctxOpen(_:)), keyEquivalent: "").representedObject = cell
-        default:
-            menu.addItem(withTitle: "Open", action: #selector(ctxOpen(_:)), keyEquivalent: "").representedObject = cell
-        }
-        if cell.item.path != nil {
-            menu.addItem(withTitle: "Reveal in Finder", action: #selector(ctxReveal(_:)), keyEquivalent: "").representedObject = cell
-        }
-        menu.addItem(.separator())
-        if isZone {
-            menu.addItem(withTitle: "Keep in Dock", action: #selector(ctxKeep(_:)), keyEquivalent: "").representedObject = cell
-        } else {
-            menu.addItem(withTitle: "Add Separator After", action: #selector(ctxAddSeparator(_:)), keyEquivalent: "").representedObject = cell
-            menu.addItem(withTitle: "Add Spacer After", action: #selector(ctxAddSpacer(_:)), keyEquivalent: "").representedObject = cell
-            menu.addItem(.separator())
-            menu.addItem(withTitle: "Remove from Dock", action: #selector(ctxRemove(_:)), keyEquivalent: "").representedObject = cell
-        }
-        for item in menu.items { item.target = self }
-        NSMenu.popUpContextMenu(menu, with: event, for: cell)
-    }
-
-    private func showGapContextMenu(for cell: DockGapCell, event: NSEvent) {
-        let menu = NSMenu()
-        let title = { if case .spacer = cell.item { return "Remove Spacer" } else { return "Remove Separator" } }()
-        let remove = menu.addItem(withTitle: title, action: #selector(ctxRemoveGap(_:)), keyEquivalent: "")
-        remove.representedObject = cell
-        remove.target = self
-        NSMenu.popUpContextMenu(menu, with: event, for: cell)
-    }
-
-    @objc private func ctxOpen(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell else { return }
-        activate(item: cell.item, from: cell)
-    }
-    @objc private func ctxReveal(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell, let path = cell.item.path else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-    }
-    @objc private func ctxRemove(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell, let index = cell.modelIndex else { return }
-        onItemsChanged?(DockItemOps.removeAt(items, index))
-    }
-    @objc private func ctxKeep(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell else { return }
-        onItemsChanged?(DockItemOps.insert(items, [cell.item], at: items.count))
-    }
-    @objc private func ctxAddSeparator(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell, let index = cell.modelIndex else { return }
-        onItemsChanged?(DockItemOps.insert(items, [.separator], at: index + 1))
-    }
-    @objc private func ctxAddSpacer(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockItemCell, let index = cell.modelIndex else { return }
-        onItemsChanged?(DockItemOps.insert(items, [.spacer(points: 24)], at: index + 1))
-    }
-    @objc private func ctxRemoveGap(_ sender: NSMenuItem) {
-        guard let cell = sender.representedObject as? DockGapCell else { return }
-        onItemsChanged?(DockItemOps.removeAt(items, cell.modelIndex))
-    }
-
-    // MARK: Drag & drop
-
-    private func beginReorderDrag(cell: DockItemCell, event: NSEvent) {
-        guard let index = cell.modelIndex else { return }
-        beginReorderDrag(view: cell, modelIndex: index, event: event)
-    }
-
-    /// Shared drag entry for icons and gap cells — both ride the same
-    /// internal-pasteboard reorder flow.
-    private func beginReorderDrag(view: NSView, modelIndex: Int, event: NSEvent) {
-        let pbItem = NSPasteboardItem()
-        pbItem.setString(String(modelIndex), forType: Self.internalType)
-        let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
-        let snapshot = view.bitmapImageRepForCachingDisplay(in: view.bounds)
-        if let snapshot { view.cacheDisplay(in: view.bounds, to: snapshot) }
-        dragItem.setDraggingFrame(view.convert(view.bounds, to: self),
-                                  contents: snapshot.map { NSImage(cgImage: $0.cgImage!, size: view.bounds.size) })
-        beginDraggingSession(with: [dragItem], event: event, source: self)
-    }
-
-    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        sender.draggingPasteboard.types?.contains(Self.internalType) == true ? .move : .copy
-    }
-    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        sender.draggingPasteboard.types?.contains(Self.internalType) == true ? .move : .copy
-    }
-
-    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let pb = sender.draggingPasteboard
-        let drop = convert(sender.draggingLocation, from: nil)
-        let target = insertionIndex(at: vertical ? drop.y : drop.x)
-
-        if let s = pb.string(forType: Self.internalType), let from = Int(s) {
-            onItemsChanged?(DockItemOps.reorder(items, from: from, to: target))
-            return true
-        }
-        if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
-            let newItems = urls.map { DockItemOps.item(forDroppedPath: $0.path) }
-            onItemsChanged?(DockItemOps.insert(items, newItems, at: target))
-            return true
-        }
-        return false
     }
 
     /// Insertion index in `items` for a drop at `cursor` along the length axis.
     /// Collects (modelIndex, center) for every rendered model item — icons AND
     /// separators/spacers — so the index is correct even with gaps in the row.
-    private func insertionIndex(at cursor: CGFloat) -> Int {
+    func insertionIndex(at cursor: CGFloat) -> Int {
         var centers: [(index: Int, center: CGFloat)] = []
         for view in stack.arrangedSubviews {
             let modelIndex: Int?

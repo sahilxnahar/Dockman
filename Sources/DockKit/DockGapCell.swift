@@ -33,6 +33,8 @@ public final class DockGapCell: NSView {
         widthAnchor.constraint(equalToConstant: w).isActive = true
         heightAnchor.constraint(equalToConstant: h).isActive = true
 
+        // Decorative for VoiceOver: skip separators/spacers when moving through the dock.
+        setAccessibilityElement(false)
         highlight.wantsLayer = true
         highlight.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
         highlight.layer?.cornerRadius = 4

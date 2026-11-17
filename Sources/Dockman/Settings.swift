@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import ConfigKit
 import DockKit
 
@@ -17,13 +18,21 @@ extension Color {
 
 // MARK: - Root
 
+// Local patch: @State is a SwiftUI macro whose plugin ships only with full Xcode, not the
+// Command Line Tools, so the selected tab lives in a plain ObservableObject instead.
+private final class SettingsTabModel: ObservableObject {
+    static let shared = SettingsTabModel()
+    @Published var selection: SettingsTab = .general
+}
+
 struct SettingsRootView: View {
     @ObservedObject var controller: DockmanController
-    @State private var selection: SettingsTab = .general
+    @ObservedObject private var tab = SettingsTabModel.shared
+    private var selection: SettingsTab { tab.selection }
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $selection) {
+            List(selection: $tab.selection) {
                 Section("Docks") {
                     ForEach(controller.config.docks) { dock in
                         Label(dock.name, systemImage: dock.enabled ? "rectangle.stack.fill" : "rectangle.stack")
@@ -76,11 +85,34 @@ struct DockSettingsView: View {
                         get: { dock.name }, set: { controller.renameDock(dockID, $0) }))
                     Toggle("Enabled", isOn: Binding(
                         get: { dock.enabled }, set: { controller.setEnabled(dockID, $0) }))
+                    Toggle("Mirror the macOS Dock", isOn: Binding(
+                        get: { dock.mirrorsSystemDock }, set: { controller.setMirrorsSystemDock(dockID, $0) }))
+                        .help("Keep this dock's items in sync with the built-in Dock's apps and folders")
+                    focusMenu(dock)
                 }
 
                 Section("Behavior") {
                     Toggle("Auto-hide", isOn: Binding(
                         get: { dock.behavior.autoHide }, set: { controller.setAutoHide(dockID, $0) }))
+                        .disabled(dock.appearance.floating)
+                        .help(dock.appearance.floating ? "Floating docks don't auto-hide" : "Slide away until the cursor reaches the screen edge")
+                    if dock.behavior.autoHide && !dock.appearance.floating {
+                        VStack(alignment: .leading) {
+                            LabeledContent("Reveal Delay", value: String(format: "%.2f s", dock.behavior.revealDelay))
+                            Slider(value: Binding(
+                                get: { dock.behavior.revealDelay },
+                                set: { controller.setRevealDelay(dockID, $0) }), in: 0...1, step: 0.05)
+                        }
+                        .help("How long the cursor rests at the edge before the dock appears")
+                    }
+                    Toggle("Collapsed to a button", isOn: Binding(
+                        get: { dock.behavior.collapsed }, set: { controller.setCollapsed(dockID, $0) }))
+                    Picker("Show/Hide Shortcut", selection: Binding(
+                        get: { dock.behavior.hotkeyDigit ?? 0 },
+                        set: { controller.setHotkey(dockID, $0 == 0 ? nil : $0) })) {
+                        Text("None").tag(0)
+                        ForEach(1...9, id: \.self) { Text("⌃⌥\($0)").tag($0) }
+                    }
                     Toggle("Summon windows to this screen", isOn: Binding(
                         get: { dock.behavior.summonWindows }, set: { controller.setSummonWindows(dockID, $0) }))
                     Toggle("Show over fullscreen apps", isOn: Binding(
@@ -97,6 +129,12 @@ struct DockSettingsView: View {
                 }
 
                 Section("Appearance") {
+                    Menu("Apply Theme") {
+                        ForEach(Appearance.themes, id: \.name) { theme in
+                            Button(theme.name) { controller.applyTheme(dockID, theme) }
+                        }
+                    }
+                    .help("One-click look: style, tint, corners and opacity")
                     Picker("Style", selection: Binding(
                         get: { dock.appearance.style }, set: { controller.setStyle(dockID, $0) })) {
                         ForEach([Appearance.Style.liquidGlass, .classic, .solid, .minimal], id: \.self) {
@@ -111,6 +149,9 @@ struct DockSettingsView: View {
                         Text("Right").tag(Appearance.Edge.right)
                     }
                     .pickerStyle(.segmented)
+                    Toggle("Floating island (drag anywhere)", isOn: Binding(
+                        get: { dock.appearance.floating }, set: { controller.setFloating(dockID, $0) }))
+                        .help("Drag the dock's background to move it. Position still sets row vs column and which side labels open.")
 
                     VStack(alignment: .leading) {
                         LabeledContent("Icon Size", value: "\(Int(dock.appearance.iconSize)) px")
@@ -150,6 +191,22 @@ struct DockSettingsView: View {
                     }
                     .help("Distance between the bar and the edge of the screen (0 = flush)")
 
+                    VStack(alignment: .leading) {
+                        LabeledContent("Corner Radius", value: "\(Int(dock.appearance.cornerRadius)) px")
+                        Slider(value: Binding(
+                            get: { dock.appearance.cornerRadius },
+                            set: { controller.setCornerRadius(dockID, $0) }), in: 0...40, step: 1)
+                    }
+
+                    if dock.appearance.style != .minimal {
+                        VStack(alignment: .leading) {
+                            LabeledContent("Background Opacity", value: "\(Int(dock.appearance.backgroundOpacity * 100))%")
+                            Slider(value: Binding(
+                                get: { dock.appearance.backgroundOpacity },
+                                set: { controller.setBackgroundOpacity(dockID, $0) }), in: 0.2...1, step: 0.05)
+                        }
+                    }
+
                     HStack {
                         Text("Tint")
                         Spacer()
@@ -183,6 +240,11 @@ struct DockSettingsView: View {
                             Divider()
                             Button("Running Apps") { controller.appendItem(dockID, .runningAppsZone) }
                                 .disabled(dock.items.contains(.runningAppsZone))
+                            Divider()
+                            ForEach(WidgetKind.allCases, id: \.self) { kind in
+                                Button(kind.displayName) { controller.appendItem(dockID, .widget(kind)) }
+                                    .disabled(dock.items.contains(.widget(kind)))
+                            }
                         } label: {
                             Label("Add Item", systemImage: "plus")
                         }
@@ -197,7 +259,13 @@ struct DockSettingsView: View {
                 }
 
                 Section {
-                    Button("Delete Dock", role: .destructive) { controller.deleteDock(dockID) }
+                    HStack {
+                        Button("Duplicate Dock") {
+                            if let id = controller.duplicateDock(dockID) { SettingsTabModel.shared.selection = .dock(id) }
+                        }
+                        Spacer()
+                        Button("Delete Dock", role: .destructive) { controller.deleteDock(dockID) }
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -208,6 +276,28 @@ struct DockSettingsView: View {
     /// Open-panel flow for "Add Item ▸ App, File, or Folder…". Apps become app
     /// items, other folders become folder stacks, files become file items —
     /// the same classification as dropping from Finder.
+    /// "Show only during Focus": pick any Focus modes; none = always shown.
+    @ViewBuilder private func focusMenu(_ dock: DockModel) -> some View {
+        let modes = controller.focus.modeNames()
+        LabeledContent("Show During Focus") {
+            Menu(dock.focusModes.isEmpty ? "Always" : dock.focusModes.joined(separator: ", ")) {
+                Button("Always (any Focus)") { controller.setFocusModes(dockID, []) }
+                if !modes.isEmpty { Divider() }
+                ForEach(modes, id: \.self) { name in
+                    Button((dock.focusModes.contains(name) ? "✓ " : "") + name) {
+                        var set = dock.focusModes
+                        if let i = set.firstIndex(of: name) { set.remove(at: i) } else { set.append(name) }
+                        controller.setFocusModes(dockID, set)
+                    }
+                }
+            }
+            .fixedSize()
+            .disabled(modes.isEmpty)
+            .help(modes.isEmpty ? "Dockman can't read your Focus modes (Full Disk Access may be needed)"
+                                : "Show this dock only while one of these Focus modes is on")
+        }
+    }
+
     private func browseAndAddItems() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -319,6 +409,8 @@ private struct ItemRow: View {
             Image(systemName: action.symbol ?? "bolt.circle.fill")
         case .runningAppsZone:
             Image(systemName: "circle.dashed").foregroundStyle(.secondary)
+        case .widget(let kind):
+            Image(systemName: kind.symbol)
         }
     }
 
@@ -336,45 +428,9 @@ private struct ItemRow: View {
             return action.label ?? action.value
         case .runningAppsZone:
             return "Running Apps"
+        case .widget(let kind):
+            return kind.displayName
         }
-    }
-}
-
-// MARK: - General
-
-struct GeneralSettingsView: View {
-    @ObservedObject var controller: DockmanController
-
-    var body: some View {
-        Form {
-            Section("Startup") {
-                Toggle("Start at Login", isOn: Binding(
-                    get: { controller.isLoginItemEnabled },
-                    set: { _ in controller.toggleLaunchAtLogin() }))
-            }
-            Section("System Dock") {
-                Toggle("Hide the built-in macOS Dock", isOn: Binding(
-                    get: { controller.config.global.hideSystemDock },
-                    set: { controller.setHideSystemDock($0) }))
-                Text("Restored automatically when turned off.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section("Docks") {
-                Button("Add Dock on Current Desktop") { controller.newDockHere() }
-            }
-            Section("About") {
-                LabeledContent("Version", value: appVersion())
-                LabeledContent("Scripting", value: "dockman://toggle?dock=Name")
-            }
-        }
-        .formStyle(.grouped)
-        .navigationTitle("General")
-    }
-
-    private func appVersion() -> String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-        return "\(v) (\(b))"
     }
 }
 

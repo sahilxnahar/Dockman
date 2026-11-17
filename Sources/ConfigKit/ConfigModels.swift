@@ -72,7 +72,18 @@ public struct Appearance: Codable, Equatable, Sendable {
     public var padding: Double
     /// Gap between the bar and its screen edge, in points (0 = flush).
     public var edgeGap: Double
+    /// Rounding of the bar's corners, in points.
+    public var cornerRadius: Double
+    /// Opacity of the background slab (0.2–1); icons stay fully opaque.
+    public var backgroundOpacity: Double
+    /// Floating island: placed anywhere on screen (drag its background) instead of at
+    /// an edge. `edge` still decides row vs column and which side labels/popovers open.
+    public var floating: Bool
+    /// Floating position as fractions (0–1) of the free space on the display.
+    public var floatX: Double
+    public var floatY: Double
 
+    public static let defaultCornerRadius: Double = 18
     public static let defaultPadding: Double = 10
     public static let defaultEdgeGap: Double = 16
     public static let defaultMagnificationScale: Double = 1.6
@@ -81,7 +92,8 @@ public struct Appearance: Codable, Equatable, Sendable {
                 tintHex: String? = nil, magnification: Bool = false,
                 magnificationScale: Double = Appearance.defaultMagnificationScale,
                 padding: Double = Appearance.defaultPadding,
-                edgeGap: Double = Appearance.defaultEdgeGap) {
+                edgeGap: Double = Appearance.defaultEdgeGap,
+                cornerRadius: Double = Appearance.defaultCornerRadius, backgroundOpacity: Double = 1) {
         self.edge = edge
         self.iconSize = iconSize
         self.style = style
@@ -90,10 +102,16 @@ public struct Appearance: Codable, Equatable, Sendable {
         self.magnificationScale = magnificationScale
         self.padding = padding
         self.edgeGap = edgeGap
+        self.cornerRadius = cornerRadius
+        self.backgroundOpacity = backgroundOpacity
+        floating = false
+        floatX = 0.5
+        floatY = 0.3
     }
 
     private enum CodingKeys: String, CodingKey {
         case edge, iconSize, style, tintHex, magnification, magnificationScale, padding, edgeGap
+        case cornerRadius, backgroundOpacity, floating, floatX, floatY
     }
 
     // Tolerant decode so configs written before newer fields existed keep the rest.
@@ -108,6 +126,38 @@ public struct Appearance: Codable, Equatable, Sendable {
             ?? Appearance.defaultMagnificationScale
         padding = try c.decodeIfPresent(Double.self, forKey: .padding) ?? Appearance.defaultPadding
         edgeGap = try c.decodeIfPresent(Double.self, forKey: .edgeGap) ?? Appearance.defaultEdgeGap
+        cornerRadius = try c.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? Appearance.defaultCornerRadius
+        backgroundOpacity = try c.decodeIfPresent(Double.self, forKey: .backgroundOpacity) ?? 1
+        floating = try c.decodeIfPresent(Bool.self, forKey: .floating) ?? false
+        floatX = min(max(try c.decodeIfPresent(Double.self, forKey: .floatX) ?? 0.5, 0), 1)
+        floatY = min(max(try c.decodeIfPresent(Double.self, forKey: .floatY) ?? 0.3, 0), 1)
+    }
+
+    /// One-click looks: style + tint + corners + opacity.
+    public struct Theme: Sendable {
+        public let name: String
+        public let style: Style
+        public let tintHex: String?
+        public let cornerRadius: Double
+        public let backgroundOpacity: Double
+    }
+    public static let themes: [Theme] = [
+        Theme(name: "Liquid Glass", style: .liquidGlass, tintHex: nil, cornerRadius: 22, backgroundOpacity: 1),
+        Theme(name: "Frosted", style: .classic, tintHex: nil, cornerRadius: 18, backgroundOpacity: 1),
+        Theme(name: "Midnight", style: .solid, tintHex: "#1C1C2E", cornerRadius: 16, backgroundOpacity: 0.92),
+        Theme(name: "Ocean", style: .liquidGlass, tintHex: "#0A84FF", cornerRadius: 22, backgroundOpacity: 1),
+        Theme(name: "Sunset", style: .solid, tintHex: "#FF6B3D", cornerRadius: 20, backgroundOpacity: 0.85),
+        Theme(name: "Forest", style: .solid, tintHex: "#2E7D4F", cornerRadius: 14, backgroundOpacity: 0.9),
+        Theme(name: "Square", style: .classic, tintHex: nil, cornerRadius: 4, backgroundOpacity: 1),
+        Theme(name: "Pill", style: .classic, tintHex: nil, cornerRadius: 40, backgroundOpacity: 1),
+        Theme(name: "Icons Only", style: .minimal, tintHex: nil, cornerRadius: 18, backgroundOpacity: 1),
+    ]
+
+    public mutating func apply(_ theme: Theme) {
+        style = theme.style
+        tintHex = theme.tintHex
+        cornerRadius = theme.cornerRadius
+        backgroundOpacity = theme.backgroundOpacity
     }
 }
 
@@ -133,6 +183,29 @@ public struct DockAction: Codable, Equatable, Sendable {
 }
 
 /// A single Dock entry.
+/// Built-in Dock widgets that aren't files or apps.
+public enum WidgetKind: String, Codable, Sendable, CaseIterable {
+    case trash, clock, battery, shelf, recents
+    public var displayName: String {
+        switch self {
+        case .trash:   return "Trash"
+        case .clock:   return "Clock"
+        case .battery: return "Battery"
+        case .shelf:   return "Shelf"
+        case .recents: return "Recent Items"
+        }
+    }
+    public var symbol: String {
+        switch self {
+        case .trash:   return "trash"
+        case .clock:   return "clock"
+        case .battery: return "battery.75percent"
+        case .shelf:   return "tray"
+        case .recents: return "clock.arrow.circlepath"
+        }
+    }
+}
+
 public enum DockItem: Codable, Equatable, Sendable {
     case app(bundlePath: String, label: String?)
     case file(path: String, label: String?)
@@ -141,6 +214,7 @@ public enum DockItem: Codable, Equatable, Sendable {
     case separator
     case action(DockAction)
     case runningAppsZone
+    case widget(WidgetKind)
 
     public var appPath: String? {
         if case let .app(path, _) = self { return path }
@@ -159,6 +233,7 @@ public enum DockItem: Codable, Equatable, Sendable {
         case .app(_, let l), .file(_, let l): return l
         case .folder(_, let l, _): return l
         case .action(let a): return a.label
+        case .widget(let w): return w.displayName
         default: return nil
         }
     }
@@ -177,14 +252,26 @@ public struct Behavior: Codable, Equatable, Sendable {
     public var autoHide: Bool
     /// When an app is clicked, move its window onto this Dock's screen (needs Accessibility).
     public var summonWindows: Bool
+    /// Seconds the cursor must rest at the screen edge before an auto-hidden Dock appears.
+    public var revealDelay: Double
+    /// Folded down to a single button; click it to expand.
+    public var collapsed: Bool
+    /// ⌃⌥ + this digit (1–9) shows/hides the Dock from anywhere; nil = no shortcut.
+    public var hotkeyDigit: Int?
 
-    public init(showOverFullscreen: Bool = false, autoHide: Bool = false, summonWindows: Bool = false) {
+    public init(showOverFullscreen: Bool = false, autoHide: Bool = false, summonWindows: Bool = false,
+                revealDelay: Double = 0, collapsed: Bool = false, hotkeyDigit: Int? = nil) {
         self.showOverFullscreen = showOverFullscreen
         self.autoHide = autoHide
         self.summonWindows = summonWindows
+        self.revealDelay = revealDelay
+        self.collapsed = collapsed
+        self.hotkeyDigit = hotkeyDigit
     }
 
-    private enum CodingKeys: String, CodingKey { case showOverFullscreen, autoHide, summonWindows }
+    private enum CodingKeys: String, CodingKey {
+        case showOverFullscreen, autoHide, summonWindows, revealDelay, collapsed, hotkeyDigit
+    }
 
     // Tolerant decode so older configs (without newer fields) still load.
     public init(from decoder: Decoder) throws {
@@ -192,6 +279,9 @@ public struct Behavior: Codable, Equatable, Sendable {
         showOverFullscreen = try c.decodeIfPresent(Bool.self, forKey: .showOverFullscreen) ?? false
         autoHide = try c.decodeIfPresent(Bool.self, forKey: .autoHide) ?? false
         summonWindows = try c.decodeIfPresent(Bool.self, forKey: .summonWindows) ?? false
+        revealDelay = min(max(try c.decodeIfPresent(Double.self, forKey: .revealDelay) ?? 0, 0), 2)
+        collapsed = try c.decodeIfPresent(Bool.self, forKey: .collapsed) ?? false
+        hotkeyDigit = (try c.decodeIfPresent(Int.self, forKey: .hotkeyDigit)).flatMap { (1...9).contains($0) ? $0 : nil }
     }
 }
 
@@ -204,10 +294,17 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
     public var appearance: Appearance
     public var behavior: Behavior
     public var enabled: Bool
+    /// Per-item icon overrides keyed by item path: an image file path, or "sf:<symbol>".
+    public var customIcons: [String: String]
+    /// Keep `items` in sync with the macOS Dock's pinned apps and folders.
+    public var mirrorsSystemDock: Bool
+    /// Show only while one of these Focus modes is on (by name); empty = always.
+    public var focusModes: [String]
 
     public init(id: UUID = UUID(), name: String, items: [DockItem],
                 binding: Binding, appearance: Appearance = Appearance(),
-                behavior: Behavior = Behavior(), enabled: Bool = true) {
+                behavior: Behavior = Behavior(), enabled: Bool = true,
+                customIcons: [String: String] = [:]) {
         self.id = id
         self.name = name
         self.items = items
@@ -215,10 +312,13 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
         self.appearance = appearance
         self.behavior = behavior
         self.enabled = enabled
+        self.customIcons = customIcons
+        mirrorsSystemDock = false
+        focusModes = []
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, items, binding, appearance, behavior, enabled
+        case id, name, items, binding, appearance, behavior, enabled, customIcons, mirrorsSystemDock, focusModes
     }
 
     // Tolerant decoding so configs written by older schema versions (no `behavior`,
@@ -232,6 +332,9 @@ public struct DockModel: Codable, Equatable, Identifiable, Sendable {
         appearance = try c.decodeIfPresent(Appearance.self, forKey: .appearance) ?? Appearance()
         behavior = try c.decodeIfPresent(Behavior.self, forKey: .behavior) ?? Behavior()
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        customIcons = try c.decodeIfPresent([String: String].self, forKey: .customIcons) ?? [:]
+        mirrorsSystemDock = try c.decodeIfPresent(Bool.self, forKey: .mirrorsSystemDock) ?? false
+        focusModes = try c.decodeIfPresent([String].self, forKey: .focusModes) ?? []
     }
 }
 
@@ -240,20 +343,24 @@ public struct GlobalSettings: Codable, Equatable, Sendable {
     public var hideSystemDock: Bool
     /// The system Dock's `autohide` value before we hid it, so we can restore exactly.
     public var priorDockAutohide: Bool?
+    /// The first-run welcome guide has been shown.
+    public var onboardingShown: Bool
 
     public init(launchAtLogin: Bool = false, hideSystemDock: Bool = false, priorDockAutohide: Bool? = nil) {
         self.launchAtLogin = launchAtLogin
         self.hideSystemDock = hideSystemDock
         self.priorDockAutohide = priorDockAutohide
+        onboardingShown = false
     }
 
-    private enum CodingKeys: String, CodingKey { case launchAtLogin, hideSystemDock, priorDockAutohide }
+    private enum CodingKeys: String, CodingKey { case launchAtLogin, hideSystemDock, priorDockAutohide, onboardingShown }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         hideSystemDock = try c.decodeIfPresent(Bool.self, forKey: .hideSystemDock) ?? false
         priorDockAutohide = try c.decodeIfPresent(Bool.self, forKey: .priorDockAutohide)
+        onboardingShown = try c.decodeIfPresent(Bool.self, forKey: .onboardingShown) ?? false
     }
 }
 

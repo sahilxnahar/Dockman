@@ -173,3 +173,35 @@ public enum AXWindowControl {
         }
     }
 }
+
+/// Unread-count badges (Mail, Messages, …) read from the system Dock's accessibility
+/// tree, keyed by app bundle path. Needs the Accessibility permission; returns [:] without it.
+public enum DockBadges {
+    /// Latest snapshot, read by Dock cells when they render.
+    public static var current: [String: String] = [:]
+
+    public static func read() -> [String: String] {
+        guard AXIsProcessTrusted(),
+              let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first
+        else { return [:] }
+        var out: [String: String] = [:]
+        for list in children(AXUIElementCreateApplication(dock.processIdentifier))
+        where string(list, kAXRoleAttribute) == kAXListRole {
+            for item in children(list) {
+                guard let badge = string(item, "AXStatusLabel"), !badge.isEmpty,
+                      let url = value(item, kAXURLAttribute) as? URL else { continue }
+                out[url.standardizedFileURL.path] = badge
+            }
+        }
+        return out
+    }
+
+    private static func value(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success ? v : nil
+    }
+    private static func string(_ el: AXUIElement, _ attr: String) -> String? { value(el, attr) as? String }
+    private static func children(_ el: AXUIElement) -> [AXUIElement] {
+        (value(el, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+    }
+}

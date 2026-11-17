@@ -66,8 +66,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "▶ Ad-hoc signing (local run only)…"
-codesign --force --sign - --timestamp=none "$APP"
+
+# A stable local identity keeps macOS privacy permissions (Accessibility etc.) across
+# rebuilds; ad-hoc signatures change every build, so macOS re-prompts each time.
+SIGN_ID="-"
+if security find-identity -p codesigning 2>/dev/null | grep -q "Dockman Local Signing"; then
+  SIGN_ID="Dockman Local Signing"
+fi
+echo "▶ Signing with: $SIGN_ID"
+codesign --force --sign "$SIGN_ID" --timestamp=none "$APP"
 codesign --verify --verbose=2 "$APP" || true
 
 echo "✅ Built $APP"

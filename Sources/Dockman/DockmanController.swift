@@ -17,6 +17,10 @@ final class DockmanController: ObservableObject {
 
     private var controllers: [UUID: DockController] = [:]
     private var mouseMonitors: [Any] = []
+    private let hotKeys = HotKeys()
+    let focus = FocusMonitor()
+    private let mirror = SystemDockMirror()
+    private var registeredHotkeys: [Int: UUID] = [:]
     /// Dock IDs whose bound Space was deleted and are currently parked (AC-4).
     private(set) var orphanedDockIDs: Set<UUID> = []
     /// Fired after config/topology changes so UI (status item) can refresh.
@@ -36,6 +40,11 @@ final class DockmanController: ObservableObject {
         monitor.start()
         activity.onChange = { [weak self] in self?.refreshActivity() }
         activity.start()
+        focus.onChange = { [weak self] in self?.reconcileAll() }
+        focus.start()
+        mirror.onChange = { [weak self] in self?.syncMirroredDocks() }
+        mirror.start()
+        syncMirroredDocks()
         // Re-render when the user changes Reduce Transparency / Reduce Motion etc.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
@@ -43,6 +52,24 @@ final class DockmanController: ObservableObject {
         syncLoginItem()
         syncSystemDock()
         reconcileAll()
+        // The system Dock posts no notification when a badge changes, so re-read it on a
+        // slow, coalesced timer (one small accessibility query; skipped without permission).
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in self?.refreshBadges() }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        badgeTimer = timer
+        refreshBadges()
+    }
+
+    private var badgeTimer: Timer?
+
+    private func refreshBadges() {
+        guard AXIsProcessTrusted(), config.docks.contains(where: { $0.enabled && ($0.items.contains { $0.appPath != nil } || $0.items.contains(.runningAppsZone)) })
+        else { return }
+        let badges = DockBadges.read()
+        guard badges != DockBadges.current else { return }
+        DockBadges.current = badges
+        refreshActivity()
     }
 
     // MARK: - Launch at login (SMAppService)
@@ -80,6 +107,9 @@ final class DockmanController: ObservableObject {
     func stop() {
         monitor.stop()
         activity.stop()
+        badgeTimer?.invalidate()
+        focus.stop()
+        mirror.stop()
         mouseMonitors.forEach { NSEvent.removeMonitor($0) }
         mouseMonitors.removeAll()
         controllers.values.forEach { $0.teardown() }
@@ -88,6 +118,7 @@ final class DockmanController: ObservableObject {
 
     /// Running apps changed → update indicators/zone without re-pinning.
     private func refreshActivity() {
+        DockBadges.current = AXIsProcessTrusted() ? DockBadges.read() : [:]
         let running = activity.snapshot()
         controllers.values.forEach { $0.refreshItems(running: running) }
     }
@@ -99,7 +130,10 @@ final class DockmanController: ObservableObject {
         let running = activity.snapshot()
         for dock in config.docks {
             let controller = controllers[dock.id] ?? makeController(for: dock)
-            controller.update(model: dock)
+            // Focus-gated docks stay hidden (not disabled in the saved config) while none of their modes is on.
+            var runtime = dock
+            if !dock.focusModes.isEmpty, focus.activeModeNames.isDisjoint(with: dock.focusModes) { runtime.enabled = false }
+            controller.update(model: runtime)
             controller.reconcile(topology: topology, running: running)
         }
         // Tear down controllers whose dock was removed.
@@ -109,14 +143,74 @@ final class DockmanController: ObservableObject {
         }
         orphanedDockIDs = Set(controllers.compactMap { $0.value.isOrphaned ? $0.key : nil })
         updateMouseMonitoring()
+        updateHotkeys()
         onStateChanged?()
     }
+
+    /// (Re)register ⌃⌥digit shortcuts only when the assignment actually changed.
+    private func updateHotkeys() {
+        var wanted: [Int: UUID] = [:]
+        for dock in config.docks { if let d = dock.behavior.hotkeyDigit, wanted[d] == nil { wanted[d] = dock.id } }
+        guard wanted != registeredHotkeys else { return }
+        registeredHotkeys = wanted
+        hotKeys.register(wanted.mapValues { id in { [weak self] in self?.toggleDock(id) } })
+    }
+
+    /// Give `digit` to `id`, taking it away from any other dock that had it.
+    func setHotkey(_ id: UUID, _ digit: Int?) {
+        if let digit {
+            for i in config.docks.indices where config.docks[i].behavior.hotkeyDigit == digit {
+                config.docks[i].behavior.hotkeyDigit = nil
+            }
+        }
+        mutate(id) { $0.behavior.hotkeyDigit = digit }
+    }
+    /// True once per install: the caller shows the welcome guide.
+    func takeOnboardingTurn() -> Bool {
+        guard !config.global.onboardingShown else { return false }
+        config.global.onboardingShown = true
+        try? store.save(config)
+        return true
+    }
+
+    func setFocusModes(_ id: UUID, _ names: [String]) { mutate(id) { $0.focusModes = names } }
+
+    func setMirrorsSystemDock(_ id: UUID, _ on: Bool) {
+        mutate(id) { $0.mirrorsSystemDock = on }
+        if on { syncMirroredDocks() }
+    }
+
+    /// A new dock that copies the macOS Dock, shown on every desktop; pick its screens in Settings.
+    func newSystemDockCopy() {
+        var dock = makeDefaultDock(name: "macOS Dock Copy")
+        dock.binding = .allSpaces
+        dock.mirrorsSystemDock = true
+        dock.items = SystemDockMirror.items()
+        config.docks.append(dock)
+        persistAndReconcile()
+    }
+
+    /// Copy the macOS Dock's current layout into every mirroring dock that differs.
+    private func syncMirroredDocks() {
+        guard config.docks.contains(where: \.mirrorsSystemDock) else { return }
+        let items = SystemDockMirror.items()
+        var changed = false
+        for i in config.docks.indices where config.docks[i].mirrorsSystemDock && config.docks[i].items != items {
+            config.docks[i].items = items
+            changed = true
+        }
+        if changed { persistAndReconcile() }
+    }
+
+    func setRevealDelay(_ id: UUID, _ s: Double) { mutate(id) { $0.behavior.revealDelay = s } }
+    func setCollapsed(_ id: UUID, _ on: Bool) { mutate(id) { $0.behavior.collapsed = on } }
+    func setFloating(_ id: UUID, _ on: Bool) { mutate(id) { $0.appearance.floating = on } }
 
     // MARK: - Auto-hide cursor tracking
 
     /// Run the global/local mouse monitors only while some Dock uses auto-hide.
     private func updateMouseMonitoring() {
-        let needed = config.docks.contains { $0.enabled && $0.behavior.autoHide }
+        let needed = config.docks.contains { $0.enabled && $0.behavior.autoHide && !$0.appearance.floating }
         if needed && mouseMonitors.isEmpty {
             let global = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in
                 self?.dispatchMouseMove()
@@ -205,6 +299,38 @@ final class DockmanController: ObservableObject {
         persistAndReconcile()
     }
 
+    func setCornerRadius(_ id: UUID, _ r: Double) { mutate(id) { $0.appearance.cornerRadius = r } }
+    func setBackgroundOpacity(_ id: UUID, _ o: Double) { mutate(id) { $0.appearance.backgroundOpacity = o } }
+    func applyTheme(_ id: UUID, _ theme: Appearance.Theme) { mutate(id) { $0.appearance.apply(theme) } }
+
+    /// Copy a dock (items, look, behaviour, placement) under a new id, right after the original.
+    @discardableResult
+    func duplicateDock(_ id: UUID) -> UUID? {
+        guard let i = index(of: id) else { return nil }
+        var copy = config.docks[i]
+        copy.id = UUID()
+        copy.name = config.docks[i].name + " Copy"
+        config.docks.insert(copy, at: i + 1)
+        persistAndReconcile()
+        return copy.id
+    }
+
+    /// Write all docks to a JSON file the user picked.
+    func exportDocks(to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(config).write(to: url, options: .atomic)
+    }
+
+    /// Replace the docks with those in an exported file. Machine-specific global
+    /// settings (login item, system Dock) are kept. Throws if the file isn't a Dockman export.
+    func importDocks(from url: URL) throws {
+        let imported = try JSONDecoder().decode(Config.self, from: Data(contentsOf: url))
+        guard !imported.docks.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        config.docks = imported.docks
+        persistAndReconcile()
+    }
+
     func deleteDock(_ id: UUID) {
         config.docks.removeAll { $0.id == id }
         persistAndReconcile()
@@ -240,7 +366,7 @@ final class DockmanController: ObservableObject {
     private func makeController(for dock: DockModel) -> DockController {
         let controller = DockController(model: dock, spaces: spaces)
         let id = dock.id
-        controller.onModelEdited = { [weak self] edited in self?.updateDockItems(id, edited.items) }
+        controller.onModelEdited = { [weak self] edited in self?.updateDockFromDock(id, edited) }
         controller.onActionCommand = { [weak self] action in self?.runActionCommand(action) }
         controllers[id] = controller
         return controller
@@ -251,6 +377,19 @@ final class DockmanController: ObservableObject {
     func updateDockItems(_ id: UUID, _ items: [DockItem]) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
         config.docks[index].items = items
+        try? store.save(config)
+        onStateChanged?()
+    }
+
+    /// Persist an edit made on the dock itself (items, custom icons, collapse, floating
+    /// position). The Dock already re-rendered, so no re-pin is needed.
+    private func updateDockFromDock(_ id: UUID, _ edited: DockModel) {
+        guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
+        config.docks[index].items = edited.items
+        config.docks[index].customIcons = edited.customIcons
+        config.docks[index].behavior.collapsed = edited.behavior.collapsed
+        config.docks[index].appearance.floatX = edited.appearance.floatX
+        config.docks[index].appearance.floatY = edited.appearance.floatY
         try? store.save(config)
         onStateChanged?()
     }

@@ -8,6 +8,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let controller: DockmanController
     private let targeting = DockTargetingController()
     private let settingsWindow = SettingsWindowController()
+    private let welcomeWindow = WelcomeWindowController()
 
     init(controller: DockmanController) {
         self.controller = controller
@@ -50,7 +51,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         addItem(to: menu, title: "Settings…", key: ",", action: #selector(openSettings))
+        addItem(to: menu, title: "Welcome Guide", key: "", action: #selector(showWelcome))
         addItem(to: menu, title: "New Dock on This Desktop", key: "n", action: #selector(newDock))
+        addItem(to: menu, title: "New Copy of the macOS Dock", key: "", action: #selector(newSystemDockCopy))
         let login = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = controller.isLoginItemEnabled ? .on : .off
@@ -161,6 +164,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         sub.addItem(.separator())
 
+        let dup = NSMenuItem(title: "Duplicate Dock", action: #selector(duplicateDock(_:)), keyEquivalent: "")
+        dup.target = self
+        dup.representedObject = dock.id
+        sub.addItem(dup)
+
         let del = NSMenuItem(title: "Delete Dock", action: #selector(deleteDock(_:)), keyEquivalent: "")
         del.target = self
         del.representedObject = dock.id
@@ -227,7 +235,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func deleteDock(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? UUID { controller.deleteDock(id) }
     }
+    @objc private func duplicateDock(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? UUID { controller.duplicateDock(id) }
+    }
+    @objc private func newSystemDockCopy() { controller.newSystemDockCopy() }
     @objc private func newDock() { controller.newDockHere() }
+    @objc func showWelcome() {
+        welcomeWindow.show { [weak self] in self?.openSettings() }
+    }
     @objc private func openSettings() { settingsWindow.show(controller: controller) }
     @objc private func toggleLogin() { controller.toggleLaunchAtLogin() }
     @objc private func quit() { NSApp.terminate(nil) }

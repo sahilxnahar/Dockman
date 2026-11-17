@@ -26,6 +26,7 @@ final class DockmanController: ObservableObject {
     /// Undo/redo history of dock layouts (items, docks added/removed), newest last.
     var undoStack: [[DockModel]] = []
     var redoStack: [[DockModel]] = []
+    var lastUndoRecord = Date.distantPast
     /// The frontmost app other than Dockman itself, for app-triggered docks.
     private(set) var frontAppPath: String?
     /// Dock IDs whose bound Space was deleted and are currently parked (AC-4).
@@ -298,7 +299,11 @@ final class DockmanController: ObservableObject {
     /// Mutate a single Dock then persist + reconcile.
     func mutate(_ id: UUID, _ change: (inout DockModel) -> Void) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
-        change(&config.docks[index])
+        var edited = config.docks[index]
+        change(&edited)
+        guard edited != config.docks[index] else { return }
+        recordUndo(coalescing: true)        // every dock edit is undoable; a slider drag is one step
+        config.docks[index] = edited
         persistAndReconcile()
     }
 
@@ -307,15 +312,12 @@ final class DockmanController: ObservableObject {
 
     // Item management (Settings "Items" editor + dock context menus).
     func moveItems(_ id: UUID, from: IndexSet, to: Int) {
-        recordUndo()
         mutate(id) { $0.items.move(fromOffsets: from, toOffset: to) }
     }
     func removeItems(_ id: UUID, at offsets: IndexSet) {
-        recordUndo()
         mutate(id) { $0.items.remove(atOffsets: offsets) }
     }
     func appendItem(_ id: UUID, _ item: ConfigKit.DockItem) {
-        recordUndo()
         mutate(id) {
             // At most one running-apps zone per dock — a second would render every
             // running app twice.
@@ -339,6 +341,7 @@ final class DockmanController: ObservableObject {
         if let ref = currentSpaceRef() {
             dock.binding = Binding(mode: .spaces, spaces: [ref])
         }
+        recordUndo()
         config.docks.append(dock)
         persistAndReconcile()
     }
@@ -423,6 +426,7 @@ final class DockmanController: ObservableObject {
     /// no window re-pin is required.
     func updateDockItems(_ id: UUID, _ items: [DockItem]) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
+        if config.docks[index].items != items { recordUndo() }
         config.docks[index].items = items
         try? store.save(config)
         onStateChanged?()
@@ -432,7 +436,9 @@ final class DockmanController: ObservableObject {
     /// position). The Dock already re-rendered, so no re-pin is needed.
     private func updateDockFromDock(_ id: UUID, _ edited: DockModel) {
         guard let index = config.docks.firstIndex(where: { $0.id == id }) else { return }
-        if config.docks[index].items != edited.items { recordUndo() }
+        if config.docks[index].items != edited.items || config.docks[index].customIcons != edited.customIcons {
+            recordUndo()
+        }
         config.docks[index].items = edited.items
         config.docks[index].customIcons = edited.customIcons
         config.docks[index].behavior.collapsed = edited.behavior.collapsed

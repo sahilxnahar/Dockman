@@ -15,6 +15,8 @@ public enum AppControl {
     }
     static func value(_ el: AXUIElement, _ attr: String) -> AnyObject? {
         var v: AnyObject?
+        // The timeout is per element (not inherited from the app element), so set it on every read.
+        AXUIElementSetMessagingTimeout(el, 1.0)
         return AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success ? v : nil
     }
     static func children(_ el: AXUIElement) -> [AXUIElement] {

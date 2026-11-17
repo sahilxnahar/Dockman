@@ -35,11 +35,19 @@ enum WidgetPopovers {
         text.font = .systemFont(ofSize: 13)
         text.isRichText = false
         text.allowsUndo = true
-        text.string = (try? String(contentsOf: DockWidgets.notesURL, encoding: .utf8)) ?? ""
+        let url = DockWidgets.notesURL
+        let saved = try? String(contentsOf: url, encoding: .utf8)
+        text.string = saved ?? ""
         text.setAccessibilityLabel("Quick notes")
-        let saver = NotesSaver(textView: text)
-        text.delegate = saver
-        objc_setAssociatedObject(text, &NotesSaver.key, saver, .OBJC_ASSOCIATION_RETAIN)
+        // A file that exists but isn't UTF-8 is shown read-only so typing can't overwrite it.
+        if saved == nil, FileManager.default.fileExists(atPath: url.path) {
+            text.isEditable = false
+            text.string = "Notes.txt couldn't be read as text, so it was left untouched."
+        } else {
+            let saver = NotesSaver(textView: text)
+            text.delegate = saver
+            objc_setAssociatedObject(text, &NotesSaver.key, saver, .OBJC_ASSOCIATION_RETAIN)
+        }
         let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         scroll.frame = box.bounds.insetBy(dx: 10, dy: 10)
         scroll.autoresizingMask = [.width, .height]

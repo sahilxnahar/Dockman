@@ -9,7 +9,12 @@ extension DockmanController {
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
-    func recordUndo() {
+    /// Snapshot the docks before an edit. `coalescing` folds rapid edits (a slider drag)
+    /// into the snapshot taken at the start of the burst.
+    func recordUndo(coalescing: Bool = false) {
+        let now = Date()
+        defer { lastUndoRecord = now }
+        if coalescing, now.timeIntervalSince(lastUndoRecord) < 1, !undoStack.isEmpty { return }
         undoStack.append(config.docks)
         if undoStack.count > 40 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -18,14 +23,25 @@ extension DockmanController {
     func undo() {
         guard let previous = undoStack.popLast() else { NSSound.beep(); return }
         redoStack.append(config.docks)
-        config.docks = previous
-        publishUndo()
-        persistAndReconcile()
+        restore(previous)
     }
     func redo() {
         guard let next = redoStack.popLast() else { NSSound.beep(); return }
         undoStack.append(config.docks)
-        config.docks = next
+        restore(next)
+    }
+    /// Apply a snapshot, keeping view state that is never recorded (collapsed, float position).
+    private func restore(_ snapshot: [DockModel]) {
+        let current = Dictionary(config.docks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        config.docks = snapshot.map { dock in
+            guard let now = current[dock.id] else { return dock }
+            var d = dock
+            d.behavior.collapsed = now.behavior.collapsed
+            d.appearance.floatX = now.appearance.floatX
+            d.appearance.floatY = now.appearance.floatY
+            return d
+        }
+        lastUndoRecord = .distantPast
         publishUndo()
         persistAndReconcile()
     }
